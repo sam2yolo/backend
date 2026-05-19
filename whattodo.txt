@@ -1,3 +1,4 @@
+Add SAM 3.1 model link
 Add demo assets
 test for local machine
 test for kaggle
