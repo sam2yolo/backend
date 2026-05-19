@@ -43,6 +43,11 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
             "batch_size": data.get("batch_size", 4),
             "save_to_mega": bool(data.get("save_to_mega", False)),
             "allow_stub_ml": ctx.settings.allow_stub_ml,
+            "model_source_url": data.get("model_source_url") or ctx.settings.sam3_model_url,
+            "model_download_url": (
+                data.get("model_download_url") or ctx.settings.sam3_model_download_url
+            ),
+            "model_filename": data.get("model_filename") or ctx.settings.sam3_model_filename,
         },
         description=data.get("description") or "Run SAM 3.1 text-prompt inference",
     )

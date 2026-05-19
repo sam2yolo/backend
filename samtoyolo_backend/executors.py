@@ -234,6 +234,9 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
             "prompt_to_class": prompt_to_class,
             "batch_size": batch_size,
             "sample_interval_seconds": params.get("sample_interval_seconds"),
+            "model_source_url": params.get("model_source_url"),
+            "model_download_url": params.get("model_download_url"),
+            "model_filename": params.get("model_filename"),
             "created_at": utc_now(),
             "stub_result": True,
         }
@@ -249,6 +252,7 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
         "format": "samtoyolo.inference.zip",
         "zip_path": rel_zip,
         "download_url": f"/v1/projects/{quote(ctx.task.project_id)}/downloads/inference/{quote(ctx.task.task_id)}",
+        "model_source_url": params.get("model_source_url"),
         "created_at": utc_now(),
     }
     ctx.store.register_inference_result(ctx.task.project_id, ctx.task.task_id, result_payload)

@@ -170,7 +170,8 @@ Result:
 
 Lists supported inference and training model names. The current code includes
 stub adapters so the API can be integrated before the heavy ML runners are
-installed.
+installed. The SAM 3.1 entry includes `model_source_url`, `model_download_url`,
+`model_file_id`, and `model_filename`.
 
 Aliases: `list_models`
 
@@ -547,6 +548,9 @@ Common variables:
 | `SAMTOYOLO_INSTANCE_TTL_SECONDS` | `42600` | 11h50m cloud-session timer. |
 | `SAMTOYOLO_EXPIRY_NOTICE_SECONDS` | `900` | When to emit `session_expiring`. |
 | `SAMTOYOLO_ALLOW_STUB_ML` | `true` | Allows stub inference/training artifacts before real adapters are installed. |
+| `SAMTOYOLO_SAM3_MODEL_URL` | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source. |
+| `SAMTOYOLO_SAM3_MODEL_FILENAME` | `sam3.1.zip` | Expected SAM 3.1 archive filename. |
+| `SAMTOYOLO_MODEL_CACHE_DIR` | `{project_root}/_models` | Shared model artifact cache directory. |
 | `TUNNELBROKER_URL` | unset | Peer registry base URL. |
 | `TUNNELBROKER_GROUP` | unset | Peer registry group. |
 | `TUNNELBROKER_GROUP_TOKEN` | unset | Optional group read/write token. |
@@ -587,3 +591,15 @@ Replace the stub sections with real model runners while preserving:
 - cancellation checks,
 - final artifact registration in `session.json`,
 - client twin sync via `client.ask`.
+
+## SAM 3.1 Model Artifact
+
+The default SAM 3.1 model source is:
+
+```text
+https://drive.google.com/file/d/1U_SBWxdyRFx-519v_UQZh48cm4y4qLVm/view?usp=sharing
+```
+
+The backend exposes this through `models()` as `model_source_url` and derives a
+direct Google Drive URL as `model_download_url`. Override it with
+`SAMTOYOLO_SAM3_MODEL_URL` when running with a different artifact.

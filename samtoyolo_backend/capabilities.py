@@ -8,6 +8,7 @@ INFERENCE_MODELS = [
         "task_type": "segmentation",
         "status": "adapter_required",
         "text_prompt": True,
+        "default_artifact": "sam3.1.zip",
     },
     {
         "name": "yolov8",

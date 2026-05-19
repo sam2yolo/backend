@@ -5,6 +5,12 @@ import socket
 from dataclasses import dataclass
 from pathlib import Path
 
+from .model_sources import (
+    DEFAULT_SAM3_MODEL_FILENAME,
+    DEFAULT_SAM3_MODEL_URL,
+    google_drive_download_url,
+)
+
 
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -31,6 +37,10 @@ class Settings:
     server_name: str = os.getenv("SAMTOYOLO_SERVER_NAME", socket.gethostname())
     gpu_workers: int = _int_env("SAMTOYOLO_GPU_WORKERS", 0)
     allow_stub_ml: bool = _bool_env("SAMTOYOLO_ALLOW_STUB_ML", True)
+    sam3_model_url: str = os.getenv("SAMTOYOLO_SAM3_MODEL_URL", DEFAULT_SAM3_MODEL_URL)
+    sam3_model_filename: str = os.getenv(
+        "SAMTOYOLO_SAM3_MODEL_FILENAME", DEFAULT_SAM3_MODEL_FILENAME
+    )
     instance_ttl_seconds: int = _int_env("SAMTOYOLO_INSTANCE_TTL_SECONDS", 42_600)
     expiry_notice_seconds: int = _int_env("SAMTOYOLO_EXPIRY_NOTICE_SECONDS", 900)
     public_base_url: str | None = os.getenv("SAMTOYOLO_PUBLIC_BASE_URL")
@@ -49,6 +59,14 @@ class Settings:
     @property
     def http_bind_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def sam3_model_download_url(self) -> str:
+        return google_drive_download_url(self.sam3_model_url)
+
+    @property
+    def model_cache_dir(self) -> Path:
+        return Path(os.getenv("SAMTOYOLO_MODEL_CACHE_DIR", self.project_root / "_models"))
 
     def resolved_gpu_workers(self) -> int:
         if self.gpu_workers > 0:
