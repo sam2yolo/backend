@@ -17,7 +17,7 @@ from .tasks import TaskContext, TaskManager
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".dav"}
 
 
 def register_default_executors(task_manager: TaskManager) -> None:

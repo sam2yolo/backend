@@ -275,6 +275,8 @@ Aliases: `inference.sam3`
 Notes:
 
 - `media_path` must point inside the project directory.
+- Video inputs may use common OpenCV-readable formats such as MP4, MOV, AVI,
+  MKV, WEBM, and DAV.
 - `sample_interval_seconds` controls video frame sampling.
 - Legacy keys `temporal_downsample` and `downsample` are accepted.
 - Each batch writes a checkpoint JSON file.
