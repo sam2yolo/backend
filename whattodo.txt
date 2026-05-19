@@ -1,0 +1,4 @@
+Add demo assets
+test for local machine
+test for kaggle
+test for colab
