@@ -1,5 +1,10 @@
-Add SAM 3.1 model link
-Add demo assets
-test for local machine
+Add SAM 3.1 model link --
+Add demo assets --
+
+create a seperate file for each task executor
+
 test for kaggle
+    Note: the actual segmentation runner is still the stub adapter, so this prepares the SAM repo/model artifact correctly but does not yet produce real SAM masks. Your local .gitignore change is still untouched.    
+
+test for local machine
 test for colab
