@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ..jsonrpc import INVALID_PARAMS, JsonRpcError
+from ..model_sources import google_drive_download_url
 from ..records import TaskType
 from ..registry import HandlerContext, registry
 from .common import bind_project, object_params, required_str
@@ -28,6 +29,15 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
     if not isinstance(prompt_to_class, dict):
         raise JsonRpcError(INVALID_PARAMS, "prompt_to_class must be an object")
     _validate_prompt_mapping(prompts, prompt_to_class)
+    model_source_url = data.get("model_source_url") or ctx.settings.sam3_model_url
+    if not isinstance(model_source_url, str) or not model_source_url:
+        raise JsonRpcError(INVALID_PARAMS, "model_source_url must be a non-empty string")
+    model_download_url = data.get("model_download_url") or google_drive_download_url(
+        model_source_url
+    )
+    model_filename = data.get("model_filename") or ctx.settings.sam3_model_filename
+    if not isinstance(model_filename, str) or not model_filename:
+        raise JsonRpcError(INVALID_PARAMS, "model_filename must be a non-empty string")
     ctx.store.ensure_project(project_id)
     await bind_project(ctx, project_id)
     task = await ctx.task_manager.submit(
@@ -43,11 +53,11 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
             "batch_size": data.get("batch_size", 4),
             "save_to_mega": bool(data.get("save_to_mega", False)),
             "allow_stub_ml": ctx.settings.allow_stub_ml,
-            "model_source_url": data.get("model_source_url") or ctx.settings.sam3_model_url,
-            "model_download_url": (
-                data.get("model_download_url") or ctx.settings.sam3_model_download_url
-            ),
-            "model_filename": data.get("model_filename") or ctx.settings.sam3_model_filename,
+            "prepare_model": bool(data.get("prepare_model", True)),
+            "model_source_url": model_source_url,
+            "model_download_url": model_download_url,
+            "model_filename": model_filename,
+            "model_cache_dir": str(ctx.settings.model_cache_dir),
         },
         description=data.get("description") or "Run SAM 3.1 text-prompt inference",
     )

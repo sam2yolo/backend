@@ -266,7 +266,8 @@ Runs SAM 3.1 text-prompt segmentation.
   },
   "sample_interval_seconds": 10,
   "batch_size": 4,
-  "save_to_mega": false
+  "save_to_mega": false,
+  "prepare_model": true
 }
 ```
 
@@ -279,6 +280,10 @@ Notes:
   MKV, WEBM, and DAV.
 - `sample_interval_seconds` controls video frame sampling.
 - Legacy keys `temporal_downsample` and `downsample` are accepted.
+- By default, the backend downloads the configured SAM 3.1 zip model artifact
+  to `SAMTOYOLO_MODEL_CACHE_DIR`, extracts it once, and reuses the extracted
+  directory on later inference runs. Set `prepare_model=false` only for
+  lightweight developer smoke tests.
 - Each batch writes a checkpoint JSON file.
 - The current executor creates a valid empty annotation zip unless real ML
   adapters are added.
@@ -605,3 +610,14 @@ https://drive.google.com/file/d/1U_SBWxdyRFx-519v_UQZh48cm4y4qLVm/view?usp=shari
 The backend exposes this through `models()` as `model_source_url` and derives a
 direct Google Drive URL as `model_download_url`. Override it with
 `SAMTOYOLO_SAM3_MODEL_URL` when running with a different artifact.
+
+When `inference_sam3` starts, the server prepares that artifact before frame
+processing:
+
+```text
+{SAMTOYOLO_MODEL_CACHE_DIR}/sam3/downloads/sam3.1.zip
+{SAMTOYOLO_MODEL_CACHE_DIR}/sam3/extracted/sam3.1/
+```
+
+The inference result metadata includes a `model_asset` object with the archive
+path, extract directory, manifest path, size, and whether the asset was reused.

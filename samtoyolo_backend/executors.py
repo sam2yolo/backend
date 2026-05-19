@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from . import events
 from .capabilities import TRAINING_MODEL_NAMES
+from .model_assets import PreparedModelAsset, prepare_zip_model_asset
 from .records import TaskType, new_id, utc_now
 from .tasks import TaskContext, TaskManager
 
@@ -161,6 +162,27 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
         raise RuntimeError(
             f"{model_name} inference adapter is not installed and stub ML is disabled"
         )
+    model_asset: PreparedModelAsset | None = None
+    progress_base = 2.0
+    progress_start = 5.0
+    if model_name == "sam3" and params.get("prepare_model", True):
+        await ctx.progress(1, "preparing SAM 3.1 model")
+
+        async def model_progress(percent: float, message: str) -> None:
+            await ctx.progress(1 + percent * 0.07, message)
+
+        model_asset = await prepare_zip_model_asset(
+            model_name="sam3",
+            source_url=params["model_source_url"],
+            download_url=params.get("model_download_url"),
+            filename=params["model_filename"],
+            cache_dir=params["model_cache_dir"],
+            progress=model_progress,
+        )
+        await ctx.progress(8, "SAM 3.1 model ready")
+        progress_base = 10.0
+        progress_start = 12.0
+
     prompts = params.get("prompts") or []
     prompt_to_class = params.get("prompt_to_class") or {}
     batch_size = max(1, int(params.get("batch_size", 4)))
@@ -172,7 +194,7 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
     frames_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    await ctx.progress(2, "preparing media")
+    await ctx.progress(progress_base, "preparing media")
     frames = await asyncio.to_thread(
         _prepare_frames,
         media_path,
@@ -222,7 +244,9 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
                 "completed_at": utc_now(),
             },
         )
-        progress = 5 + ((batch_index + 1) / total_batches) * 85
+        progress = progress_start + ((batch_index + 1) / total_batches) * (
+            90 - progress_start
+        )
         await ctx.progress(progress, f"processed batch {batch_index + 1}/{total_batches}")
         await _checkpoint_client_fetch(ctx, checkpoint_path)
 
@@ -237,6 +261,7 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
             "model_source_url": params.get("model_source_url"),
             "model_download_url": params.get("model_download_url"),
             "model_filename": params.get("model_filename"),
+            "model_asset": model_asset.to_dict() if model_asset else None,
             "created_at": utc_now(),
             "stub_result": True,
         }
@@ -253,6 +278,7 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
         "zip_path": rel_zip,
         "download_url": f"/v1/projects/{quote(ctx.task.project_id)}/downloads/inference/{quote(ctx.task.task_id)}",
         "model_source_url": params.get("model_source_url"),
+        "model_asset": model_asset.to_dict() if model_asset else None,
         "created_at": utc_now(),
     }
     ctx.store.register_inference_result(ctx.task.project_id, ctx.task.task_id, result_payload)
