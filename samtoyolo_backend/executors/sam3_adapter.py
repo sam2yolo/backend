@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import io
+import inspect
 import re
 import threading
 from dataclasses import dataclass
@@ -106,14 +107,15 @@ def run_sam3_video_text_inference(
     total_stream_steps = max(1, len(prompts) * max(1, len(frames)))
     try:
         _raise_if_cancelled(is_cancelled)
-        response = predictor.handle_request(
-            request={
-                "type": "start_session",
-                "resource_path": str(frames_dir),
-                "offload_video_to_cpu": offload_video_to_cpu,
-                "offload_state_to_cpu": offload_state_to_cpu,
-            }
-        )
+        with _patch_init_state_kwargs(predictor, {"offload_state_to_cpu"}):
+            response = predictor.handle_request(
+                request={
+                    "type": "start_session",
+                    "resource_path": str(frames_dir),
+                    "offload_video_to_cpu": offload_video_to_cpu,
+                    "offload_state_to_cpu": offload_state_to_cpu,
+                }
+            )
         session_id = str(response["session_id"])
 
         for prompt_index, prompt in enumerate(prompts):
@@ -347,7 +349,11 @@ def _build_predictor(
         ) from exc
 
     summary = _checkpoint_load_summary(build_log.getvalue())
-    if summary and not allow_partial_checkpoint:
+    if (
+        summary
+        and not allow_partial_checkpoint
+        and not _is_expected_sam31_multiplex_loader_warning(summary)
+    ):
         raise Sam3AdapterError(
             "SAM 3.1 checkpoint did not load cleanly with the installed "
             "facebookresearch/sam3 package, so real inference was stopped instead "
@@ -357,6 +363,47 @@ def _build_predictor(
             f"Checkpoint loader output: {summary}"
         )
     return predictor
+
+
+@contextlib.contextmanager
+def _patch_init_state_kwargs(predictor: Any, candidate_kwargs: set[str]):
+    """Drop kwargs that SAM 3.1's model init_state does not accept."""
+
+    model = getattr(predictor, "model", None)
+    init_state = getattr(model, "init_state", None)
+    if model is None or init_state is None:
+        yield
+        return
+
+    try:
+        signature = inspect.signature(init_state)
+    except (TypeError, ValueError):
+        yield
+        return
+
+    accepts_extra_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+    if accepts_extra_kwargs:
+        yield
+        return
+
+    unsupported = {name for name in candidate_kwargs if name not in signature.parameters}
+    if not unsupported:
+        yield
+        return
+
+    def compatible_init_state(*args: Any, **kwargs: Any) -> Any:
+        for name in unsupported:
+            kwargs.pop(name, None)
+        return init_state(*args, **kwargs)
+
+    setattr(model, "init_state", compatible_init_state)
+    try:
+        yield
+    finally:
+        setattr(model, "init_state", init_state)
 
 
 def _drop_cached_predictor(checkpoint_path: Path, gpu_index: int) -> None:
@@ -396,6 +443,24 @@ def _checkpoint_load_summary(output: str) -> str | None:
         else:
             parts.append(_shorten(line, 300))
     return "; ".join(parts)
+
+
+def _is_expected_sam31_multiplex_loader_warning(summary: str) -> bool:
+    """Meta's SAM3.1 builder logs a noisy tracker-only preload warning.
+
+    The merged `sam3.1_multiplex.pt` checkpoint is first loaded into the
+    tracker-only submodel and then loaded again into the assembled detector +
+    tracker model. That first internal load reports unprefixed tracker keys as
+    missing and `tracker.model.*`/`detector.*` keys as unexpected even when the
+    final assembled model load succeeds.
+    """
+
+    return (
+        "Missing keys" in summary
+        and "Unexpected keys" in summary
+        and "tracker.model." in summary
+        and "detector." in summary
+    )
 
 
 def _shorten(value: str, limit: int) -> str:
