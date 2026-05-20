@@ -1,3 +1,7 @@
 commit
 tunnelbroker/
 assets/
+.samtoyolo/
+projects/
+__pycache__/
+*.py[cod]

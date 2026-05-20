@@ -28,6 +28,8 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
         raise JsonRpcError(INVALID_PARAMS, "prompts must be a list of strings")
     if not isinstance(prompt_to_class, dict):
         raise JsonRpcError(INVALID_PARAMS, "prompt_to_class must be an object")
+    if not all(isinstance(value, str) for value in prompt_to_class.values()):
+        raise JsonRpcError(INVALID_PARAMS, "prompt_to_class values must be strings")
     _validate_prompt_mapping(prompts, prompt_to_class)
     model_source_url = data.get("model_source_url") or ctx.settings.sam3_model_url
     if not isinstance(model_source_url, str) or not model_source_url:
@@ -53,11 +55,29 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
             "batch_size": data.get("batch_size", 4),
             "save_to_mega": bool(data.get("save_to_mega", False)),
             "allow_stub_ml": ctx.settings.allow_stub_ml,
+            "use_stub_inference": bool(
+                data.get("use_stub_inference", data.get("stub_inference", False))
+            ),
             "prepare_model": bool(data.get("prepare_model", True)),
             "model_source_url": model_source_url,
             "model_download_url": model_download_url,
             "model_filename": model_filename,
             "model_cache_dir": str(ctx.settings.model_cache_dir),
+            "output_prob_thresh": data.get("output_prob_thresh"),
+            "confidence_threshold": data.get("confidence_threshold"),
+            "include_masks": data.get("include_masks", True),
+            "sam3_max_num_objects": data.get("sam3_max_num_objects", 16),
+            "sam3_multiplex_count": data.get("sam3_multiplex_count", 16),
+            "sam3_use_fa3": data.get("sam3_use_fa3", False),
+            "sam3_compile": data.get("sam3_compile", False),
+            "sam3_warm_up": data.get("sam3_warm_up", False),
+            "sam3_async_loading_frames": data.get("sam3_async_loading_frames", False),
+            "sam3_cache_model": data.get("sam3_cache_model", True),
+            "sam3_allow_partial_checkpoint": data.get(
+                "sam3_allow_partial_checkpoint", False
+            ),
+            "offload_video_to_cpu": data.get("offload_video_to_cpu", True),
+            "offload_state_to_cpu": data.get("offload_state_to_cpu", False),
         },
         description=data.get("description") or "Run SAM 3.1 text-prompt inference",
     )

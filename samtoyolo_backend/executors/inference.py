@@ -18,6 +18,7 @@ from .common import (
     write_json,
     zip_directory,
 )
+from .sam3_adapter import run_sam3_video_text_inference
 
 
 async def execute_inference_sam3(ctx: TaskContext) -> dict[str, Any]:
@@ -30,14 +31,18 @@ async def execute_inference_yolo(ctx: TaskContext) -> dict[str, Any]:
 
 async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, Any]:
     params = ctx.task.params
-    if not params.get("allow_stub_ml", True):
+    use_stub_inference = _bool_param(params, "use_stub_inference", False)
+    if use_stub_inference and not params.get("allow_stub_ml", True):
+        raise RuntimeError(f"{model_name} stub inference is disabled")
+    if model_name != "sam3" and not params.get("allow_stub_ml", True):
         raise RuntimeError(
             f"{model_name} inference adapter is not installed and stub ML is disabled"
         )
     model_asset: PreparedModelAsset | None = None
     progress_base = 2.0
     progress_start = 5.0
-    if model_name == "sam3" and params.get("prepare_model", True):
+    prepare_model = _bool_param(params, "prepare_model", True)
+    if model_name == "sam3" and not use_stub_inference and prepare_model:
         await ctx.progress(1, "preparing SAM 3.1 model")
 
         async def model_progress(percent: float, message: str) -> None:
@@ -94,23 +99,65 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
         "model_name": model_name,
         "frames": [],
     }
-    total_batches = max(1, math.ceil(len(frames) / batch_size))
+    inference_metadata: dict[str, Any] = {}
+    if model_name == "sam3" and not use_stub_inference:
+        if model_asset is None:
+            raise RuntimeError("SAM 3.1 model must be prepared before real inference")
+        loop = asyncio.get_running_loop()
+
+        def sam3_progress(
+            percent: float,
+            message: str,
+            metrics: dict[str, Any] | None = None,
+        ) -> None:
+            future = asyncio.run_coroutine_threadsafe(
+                ctx.progress(percent, message, metrics=metrics),
+                loop,
+            )
+            future.result()
+
+        sam3_result = await asyncio.to_thread(
+            run_sam3_video_text_inference,
+            frames_dir=frames_dir,
+            frames=frames,
+            prompts=prompts,
+            prompt_to_class=prompt_to_class,
+            model_extract_dir=model_asset.extract_dir,
+            gpu_index=ctx.task.gpu_index,
+            output_prob_thresh=_float_param(
+                params, "output_prob_thresh", "confidence_threshold", default=0.5
+            ),
+            max_num_objects=max(1, _int_param(params, "sam3_max_num_objects", 16)),
+            multiplex_count=max(1, _int_param(params, "sam3_multiplex_count", 16)),
+            use_fa3=_bool_param(params, "sam3_use_fa3", False),
+            compile_model=_bool_param(params, "sam3_compile", False),
+            warm_up=_bool_param(params, "sam3_warm_up", False),
+            async_loading_frames=_bool_param(params, "sam3_async_loading_frames", False),
+            offload_video_to_cpu=_bool_param(params, "offload_video_to_cpu", True),
+            offload_state_to_cpu=_bool_param(params, "offload_state_to_cpu", False),
+            cache_model=_bool_param(params, "sam3_cache_model", True),
+            allow_partial_checkpoint=_bool_param(
+                params, "sam3_allow_partial_checkpoint", False
+            ),
+            include_masks=_bool_param(params, "include_masks", True),
+            progress=sam3_progress,
+            is_cancelled=ctx.is_cancelled,
+            progress_start=progress_start,
+            progress_end=88.0,
+        )
+        annotations["frames"] = sam3_result.frames
+        inference_metadata.update(sam3_result.metadata)
+    else:
+        annotations["frames"] = _stub_annotation_rows(frames)
+        inference_metadata["stub_result"] = True
+
+    total_batches = max(1, math.ceil(len(annotations["frames"]) / batch_size))
     for batch_index in range(total_batches):
         if ctx.is_cancelled():
             raise RuntimeError("inference cancelled")
         start = batch_index * batch_size
         end = start + batch_size
-        batch_frames = frames[start:end] or []
-        batch_rows = [
-            {
-                "file_name": frame.name,
-                "width": None,
-                "height": None,
-                "objects": [],
-            }
-            for frame in batch_frames
-        ]
-        annotations["frames"].extend(batch_rows)
+        batch_rows = annotations["frames"][start:end] or []
         checkpoint_path = checkpoint_dir / f"batch_{batch_index + 1:06d}.json"
         write_json(
             checkpoint_path,
@@ -120,10 +167,15 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
                 "completed_at": utc_now(),
             },
         )
-        progress = progress_start + ((batch_index + 1) / total_batches) * (
-            90 - progress_start
-        )
-        await ctx.progress(progress, f"processed batch {batch_index + 1}/{total_batches}")
+        if model_name == "sam3" and not use_stub_inference:
+            progress = 88 + ((batch_index + 1) / total_batches) * 4
+            message = f"checkpointed SAM batch {batch_index + 1}/{total_batches}"
+        else:
+            progress = progress_start + ((batch_index + 1) / total_batches) * (
+                90 - progress_start
+            )
+            message = f"processed batch {batch_index + 1}/{total_batches}"
+        await ctx.progress(progress, message)
         await checkpoint_client_fetch(ctx, checkpoint_path)
 
     metadata.update(
@@ -139,7 +191,10 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
             "model_filename": params.get("model_filename"),
             "model_asset": model_asset.to_dict() if model_asset else None,
             "created_at": utc_now(),
-            "stub_result": True,
+            "stub_result": bool(inference_metadata.get("stub_result", False)),
+            "worker_id": ctx.task.worker_id,
+            "gpu_index": ctx.task.gpu_index,
+            **inference_metadata,
         }
     )
     write_json(result_dir / "annotations.json", annotations)
@@ -183,6 +238,44 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
 
     await ctx.progress(100, "inference result packaged")
     return result_payload
+
+
+def _stub_annotation_rows(frames: list[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for frame in frames:
+        rows.append(
+            {
+                "file_name": frame.name,
+                "width": None,
+                "height": None,
+                "objects": [],
+            }
+        )
+    return rows
+
+
+def _float_param(params: dict[str, Any], *names: str, default: float) -> float:
+    for name in names:
+        value = params.get(name)
+        if value is not None:
+            return float(value)
+    return default
+
+
+def _int_param(params: dict[str, Any], name: str, default: int) -> int:
+    value = params.get(name)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _bool_param(params: dict[str, Any], name: str, default: bool) -> bool:
+    value = params.get(name)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _prepare_frames(source: Path, frames_dir: Path, sample_value: Any) -> list[Path]:

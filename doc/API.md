@@ -160,7 +160,13 @@ Result:
   "ready": true,
   "project_root": "/abs/path/projects",
   "gpu_workers": 1,
-  "mode": "local"
+  "mode": "local",
+  "runtime_environment": {
+    "bootstrap_enabled": true,
+    "bootstrapped": true,
+    "conda_env_name": "samtoyolo-sam3",
+    "in_conda_env": true
+  }
 }
 ```
 
@@ -168,10 +174,10 @@ Result:
 
 #### `models()`
 
-Lists supported inference and training model names. The current code includes
-stub adapters so the API can be integrated before the heavy ML runners are
-installed. The SAM 3.1 entry includes `model_source_url`, `model_download_url`,
-`model_file_id`, and `model_filename`.
+Lists supported inference and training model names. SAM 3.1 is wired to the
+official `sam3` package for real CUDA inference. The SAM 3.1 entry includes
+`model_source_url`, `model_download_url`, `model_file_id`, and
+`model_filename`.
 
 Aliases: `list_models`
 
@@ -282,11 +288,21 @@ Notes:
 - Legacy keys `temporal_downsample` and `downsample` are accepted.
 - By default, the backend downloads the configured SAM 3.1 zip model artifact
   to `SAMTOYOLO_MODEL_CACHE_DIR`, extracts it once, and reuses the extracted
-  directory on later inference runs. Set `prepare_model=false` only for
-  lightweight developer smoke tests.
+  directory on later inference runs.
+- Real inference loads `sam3.1_multiplex.pt` from the extracted artifact using
+  the official `sam3` video predictor. The model is loaded on the task's
+  assigned GPU worker (`gpu_index`).
+- Set `use_stub_inference=true` only for lightweight developer smoke tests.
+- Optional SAM runtime keys include `output_prob_thresh`,
+  `confidence_threshold`, `include_masks`, `sam3_max_num_objects`,
+  `sam3_multiplex_count`, `sam3_use_fa3`, `sam3_compile`,
+  `sam3_async_loading_frames`, `sam3_cache_model`, and
+  `sam3_allow_partial_checkpoint`.
+- The backend refuses to continue if the SAM checkpoint reports missing or
+  unexpected keys during load, because that would produce non-real predictions.
+  `sam3_allow_partial_checkpoint=true` is only for debugging incompatible SAM
+  package/checkpoint pairs.
 - Each batch writes a checkpoint JSON file.
-- The current executor creates a valid empty annotation zip unless real ML
-  adapters are added.
 
 Output artifact:
 
@@ -558,6 +574,13 @@ Common variables:
 | `SAMTOYOLO_SAM3_MODEL_URL` | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source. |
 | `SAMTOYOLO_SAM3_MODEL_FILENAME` | `sam3.1.zip` | Expected SAM 3.1 archive filename. |
 | `SAMTOYOLO_MODEL_CACHE_DIR` | `{project_root}/_models` | Shared model artifact cache directory. |
+| `SAMTOYOLO_CONDA_BOOTSTRAP` | `true` | Create/re-enter the SAM conda environment on startup. |
+| `SAMTOYOLO_CONDA_ENV_NAME` | `samtoyolo-sam3` | Runtime conda environment name. |
+| `SAMTOYOLO_CONDA_PYTHON` | `3.12` | Python version used when creating the env. |
+| `SAMTOYOLO_CONDA_INSTALL_PREFIX` | `~/.samtoyolo/miniforge3` | Conda install path when conda is missing. |
+| `SAMTOYOLO_TORCH_INDEX_URL` | PyTorch CUDA 12.8 index | Torch wheel index used during bootstrap. |
+| `SAMTOYOLO_INSTALL_TORCH` | `true` | Install torch/torchvision before requirements. |
+| `SAMTOYOLO_REQUIREMENTS_FILE` | `requirements.txt` | Requirements file installed into the env. |
 | `TUNNELBROKER_URL` | unset | Peer registry base URL. |
 | `TUNNELBROKER_GROUP` | unset | Peer registry group. |
 | `TUNNELBROKER_GROUP_TOKEN` | unset | Optional group read/write token. |
@@ -565,6 +588,17 @@ Common variables:
 | `CLOUDFLARED_PATH` | `cloudflared` | Cloudflared executable. |
 
 Run locally:
+
+```bash
+python -m samtoyolo_backend.run
+```
+
+On first run, the backend checks for the configured conda environment. If it is
+missing, the backend creates it, installs a CUDA-enabled PyTorch build and the
+repository requirements, then re-execs itself inside that environment. If conda
+is not installed, Miniforge is installed first.
+
+Direct uvicorn startup is also supported and performs the same bootstrap:
 
 ```bash
 uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000
@@ -582,9 +616,12 @@ uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000
 
 ## Adapter Boundaries
 
-The current implementation is intentionally runnable without installing SAM,
-Ultralytics, Detectron2, or other large ML packages. The adapter points are:
+SAM 3.1 inference requires CUDA-enabled `torch`/`torchvision` and the official
+`sam3` package from GitHub. YOLO/training placeholders are still intentionally
+runnable without their large ML packages. The adapter points are:
 
+- `run_sam3_video_text_inference` in
+  `samtoyolo_backend/executors/sam3_adapter.py`
 - `execute_inference_sam3` in `samtoyolo_backend/executors/inference.py`
 - `execute_inference_yolo` in `samtoyolo_backend/executors/inference.py`
 - `execute_train_model` in `samtoyolo_backend/executors/training.py`

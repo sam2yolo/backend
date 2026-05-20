@@ -8,6 +8,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+from .runtime_env import ensure_runtime_environment
+
+ensure_runtime_environment()
+
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask

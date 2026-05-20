@@ -3,6 +3,7 @@ from __future__ import annotations
 from .. import events
 from ..jsonrpc import INVALID_PARAMS, JsonRpcError
 from ..registry import HandlerContext, registry
+from ..runtime_env import runtime_environment_status
 from .common import bind_project, object_params, required_str
 
 
@@ -68,4 +69,5 @@ async def handle_backend_init(ctx: HandlerContext, params: object) -> dict[str, 
         "project_root": str(ctx.settings.project_root),
         "gpu_workers": ctx.task_manager.gpu_workers,
         "mode": ctx.settings.mode,
+        "runtime_environment": runtime_environment_status(),
     }
