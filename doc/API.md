@@ -585,11 +585,11 @@ uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000
 The current implementation is intentionally runnable without installing SAM,
 Ultralytics, Detectron2, or other large ML packages. The adapter points are:
 
-- `execute_inference_sam3` in `samtoyolo_backend/executors.py`
-- `execute_inference_yolo` in `samtoyolo_backend/executors.py`
-- `execute_train_model` in `samtoyolo_backend/executors.py`
-- Mega mount/upload/download logic in `samtoyolo_backend/executors.py` and
-  `samtoyolo_backend/handlers/mega_handlers.py`
+- `execute_inference_sam3` in `samtoyolo_backend/executors/inference.py`
+- `execute_inference_yolo` in `samtoyolo_backend/executors/inference.py`
+- `execute_train_model` in `samtoyolo_backend/executors/training.py`
+- upload/download logic in `samtoyolo_backend/executors/upload.py`
+- Mega mount/upload adapter logic in `samtoyolo_backend/handlers/mega_handlers.py`
 
 Replace the stub sections with real model runners while preserving:
 
