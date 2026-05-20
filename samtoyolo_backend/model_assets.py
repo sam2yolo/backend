@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import shutil
@@ -205,6 +206,10 @@ def _google_drive_confirm_url(
             return _replace_query_param(current_url, "confirm", value)
 
     normalised_html = html.replace("&amp;", "&")
+    form_url = _google_drive_form_url(normalised_html)
+    if form_url:
+        return form_url
+
     href_match = re.search(
         r'href="([^"]*(?:/uc\?|/download\?)[^"]*confirm=[^"]+)"',
         normalised_html,
@@ -217,6 +222,42 @@ def _google_drive_confirm_url(
         return _replace_query_param(current_url, "confirm", confirm_match.group(1))
 
     return None
+
+
+def _google_drive_form_url(document: str) -> str | None:
+    form_match = re.search(
+        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"[^>]*>(.*?)</form>',
+        document,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not form_match:
+        return None
+
+    action = html.unescape(form_match.group(1))
+    form_body = form_match.group(2)
+    query: list[tuple[str, str]] = []
+    for input_match in re.finditer(r"<input\b[^>]*>", form_body, re.IGNORECASE):
+        attrs = _html_attrs(input_match.group(0))
+        name = attrs.get("name")
+        if name:
+            query.append((name, attrs.get("value", "")))
+    if not query:
+        return None
+
+    parsed = urlparse(action)
+    existing = parse_qsl(parsed.query)
+    return urlunparse(parsed._replace(query=urlencode([*existing, *query])))
+
+
+def _html_attrs(tag: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for match in re.finditer(
+        r"""([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+        tag,
+    ):
+        value = next(group for group in match.groups()[1:] if group is not None)
+        attrs[match.group(1).lower()] = html.unescape(value)
+    return attrs
 
 
 def _replace_query_param(url: str, key: str, value: str) -> str:
