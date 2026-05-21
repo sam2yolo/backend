@@ -45,6 +45,11 @@ class Settings:
     sam3_model_server_url: str = os.getenv(
         "SAMTOYOLO_SAM3_SERVER_URL", "ws://127.0.0.1:8101/v1/ws"
     )
+    model_servers_auto_start: bool = _bool_env("SAMTOYOLO_MODEL_SERVERS_AUTO_START", True)
+    model_servers_public_tunnel: bool = _bool_env(
+        "SAMTOYOLO_MODEL_SERVERS_PUBLIC_TUNNEL", False
+    )
+    sam3_model_server_port: int = _int_env("SAMTOYOLO_SAM3_SERVER_PORT", 8101)
     instance_ttl_seconds: int = _int_env("SAMTOYOLO_INSTANCE_TTL_SECONDS", 42_600)
     expiry_notice_seconds: int = _int_env("SAMTOYOLO_EXPIRY_NOTICE_SECONDS", 900)
     public_base_url: str | None = os.getenv("SAMTOYOLO_PUBLIC_BASE_URL")

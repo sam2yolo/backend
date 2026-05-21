@@ -67,11 +67,21 @@ def _create_rpc(websocket: WebSocket | None = None) -> JsonRpcServer:
             "methods": rpc.describe(),
         }
 
-    @rpc.method("sam3.infer_video_text")
     async def infer_video_text(params: dict[str, Any]) -> dict[str, Any]:
         if websocket is None:
             raise RuntimeError("sam3.infer_video_text requires a WebSocket connection")
         return await _infer_video_text(websocket, params)
+
+    rpc.method("sam3.infer_video_text")(infer_video_text)
+    rpc.method("inference_sam3")(infer_video_text)
+
+    @rpc.method("train_model")
+    async def train_model(params: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "accepted": False,
+            "model": "sam3",
+            "message": "SAM3 training is not implemented in this model server yet.",
+        }
 
     return rpc
 

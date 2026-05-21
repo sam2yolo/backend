@@ -22,6 +22,7 @@ from .config import Settings
 from .connections import ConnectionManager
 from .executors import register_default_executors
 from .jsonrpc import PARSE_ERROR, dispatch_payload, error_response
+from .model_servers import ModelServerManager
 from .records import TaskType, new_id
 from .registry import HandlerContext, registry
 from .storage import ProjectStore, StorageError
@@ -47,15 +48,18 @@ async def lifespan(app: FastAPI):
     )
     register_default_executors(task_manager)
     tunnel_manager = TunnelManager(settings, connections)
+    model_server_manager = ModelServerManager(settings)
 
     app.state.settings = settings
     app.state.connections = connections
     app.state.store = store
     app.state.task_manager = task_manager
     app.state.tunnel_manager = tunnel_manager
+    app.state.model_server_manager = model_server_manager
     app.state.mega_credentials = {}
 
     await task_manager.start()
+    await model_server_manager.start()
     await tunnel_manager.start()
     expiry_monitor = asyncio.create_task(_session_expiry_monitor(settings, connections))
     app.state.expiry_monitor = expiry_monitor
@@ -65,6 +69,7 @@ async def lifespan(app: FastAPI):
         expiry_monitor.cancel()
         await asyncio.gather(expiry_monitor, return_exceptions=True)
         await tunnel_manager.stop()
+        await model_server_manager.stop()
         await task_manager.stop()
 
 

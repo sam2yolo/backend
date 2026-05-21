@@ -1,8 +1,9 @@
 # Model Servers
 
-Each model runs in its own process and conda environment. The main backend keeps
-project/session/task state, extracts media frames, packages results, and calls
-model servers over JSON-RPC 2.0 WebSockets.
+Each model runs in its own process and conda environment. The main backend sets
+up and starts model servers, then publishes public Cloudflare Tunnel endpoints
+to Tunnelbroker in remote mode. Clients call inference/training RPCs on model
+servers directly over JSON-RPC 2.0 WebSockets.
 
 Model servers currently expect access to the same project/model-cache filesystem
 as the backend because RPC calls pass frame and checkpoint paths. If a model
@@ -30,7 +31,9 @@ export SAMTOYOLO_SAM3_SERVER_URL=ws://host:8101/v1/ws
 The SAM server exposes:
 
 - `health`
+- `inference_sam3`
 - `sam3.infer_video_text`
+- `train_model`
 
 Long-running calls emit `model.progress` JSON-RPC notifications while the final
 response contains `{ "frames": [...], "metadata": {...} }`.

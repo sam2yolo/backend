@@ -260,7 +260,9 @@ Aliases: `mega_upload`, `download_mega`
 
 #### `inference_sam3(...)`
 
-Runs SAM 3.1 text-prompt segmentation.
+Compatibility discovery method for SAM 3.1 text-prompt segmentation. The main
+backend no longer runs model inference; it ensures the SAM3 model server is set
+up and returns the model-server endpoint and RPC method to call.
 
 ```json
 {
@@ -282,29 +284,13 @@ Aliases: `inference.sam3`
 
 Notes:
 
-- `media_path` must point inside the project directory.
-- Video inputs may use common OpenCV-readable formats such as MP4, MOV, AVI,
-  MKV, WEBM, and DAV.
-- `sample_interval_seconds` controls video frame sampling.
-- Legacy keys `temporal_downsample` and `downsample` are accepted.
-- By default, the backend downloads the configured SAM 3.1 zip model artifact
-  to `SAMTOYOLO_MODEL_CACHE_DIR`, extracts it once, and reuses the extracted
-  directory on later inference runs.
-- Real inference is sent to the configured SAM model server
-  (`model_server_url` or `SAMTOYOLO_SAM3_SERVER_URL`). That server loads
-  `sam3.1_multiplex.pt` from the extracted artifact using the official `sam3`
-  video predictor. The requested GPU is the task's assigned `gpu_index`.
-- Set `use_stub_inference=true` only for lightweight developer smoke tests.
-- Optional SAM runtime keys include `output_prob_thresh`,
-  `confidence_threshold`, `include_masks`, `sam3_max_num_objects`,
-  `sam3_multiplex_count`, `sam3_use_fa3`, `sam3_compile`,
-  `sam3_async_loading_frames`, `sam3_cache_model`, and
-  `sam3_allow_partial_checkpoint`.
-- The backend refuses to continue if the SAM checkpoint reports missing or
-  unexpected keys during load, because that would produce non-real predictions.
-  `sam3_allow_partial_checkpoint=true` is only for debugging incompatible SAM
-  package/checkpoint pairs.
-- Each batch writes a checkpoint JSON file.
+- Returned `model_server.public_ws_url` is the public Cloudflare/Tunnelbroker
+  WebSocket endpoint when remote mode is enabled; otherwise use
+  `model_server.local_ws_url`.
+- Call `inference_sam3` or `sam3.infer_video_text` on that model-server
+  endpoint for real inference.
+- The main backend keeps upload/project/dataset management; model servers own
+  inference and training runtimes.
 
 Output artifact:
 
@@ -365,6 +351,11 @@ Alias: `dataset.list`
 ### Training
 
 #### `train_model(project_id, model_name, dataset_id, config?)`
+
+Compatibility discovery method for training. The main backend no longer trains
+models directly; it returns the matching model-server endpoint and the
+`train_model` RPC method to call. Model-server training support is implemented
+per model.
 
 Supported names:
 
@@ -576,6 +567,9 @@ Common variables:
 | `SAMTOYOLO_SAM3_MODEL_URL` | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source. |
 | `SAMTOYOLO_SAM3_MODEL_FILENAME` | `sam3.1.zip` | Expected SAM 3.1 archive filename. |
 | `SAMTOYOLO_SAM3_SERVER_URL` | `ws://127.0.0.1:8101/v1/ws` | SAM 3.1 model server WebSocket endpoint. |
+| `SAMTOYOLO_MODEL_SERVERS_AUTO_START` | `true` | Set up and start model servers on backend startup. |
+| `SAMTOYOLO_MODEL_SERVERS_PUBLIC_TUNNEL` | `false` | Create public tunnels for model servers even outside remote mode. |
+| `SAMTOYOLO_SAM3_SERVER_PORT` | `8101` | Local SAM3 model server port. |
 | `SAMTOYOLO_MODEL_CACHE_DIR` | `{project_root}/_models` | Shared model artifact cache directory. |
 | `SAMTOYOLO_CONDA_BOOTSTRAP` | `true` | Create/re-enter the backend conda environment on startup. |
 | `SAMTOYOLO_CONDA_ENV_NAME` | `samtoyolo-backend` | Backend runtime conda environment name. |
@@ -617,12 +611,17 @@ TUNNELBROKER_PEER_SECRET=peer-owned-secret \
 uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000
 ```
 
+In remote mode, the main backend also starts model servers, creates a
+Cloudflare Tunnel for each model-server HTTP endpoint, and registers each model
+server as a Tunnelbroker peer using `TUNNELBROKER_PEER_SECRET`. Model-server
+peer metadata includes `model`, `capabilities`, and `ws_endpoint`.
+
 ## Model Server Boundaries
 
 Each heavy model runs in a separate FastAPI model server with its own conda
-environment and WebSocket JSON-RPC endpoint. The backend keeps project state,
-task queues, frame extraction, result packaging, checkpoint events, and client
-sync. Model servers own CUDA runtimes and model-specific packages.
+environment and WebSocket JSON-RPC endpoint. The backend sets up, starts, and
+publishes model servers. Model servers own inference/training RPCs, CUDA
+runtimes, and model-specific packages.
 
 In v1.0, model servers are intended to run on the same machine or a shared
 filesystem with the backend. The backend passes sampled frame directories and
@@ -633,20 +632,24 @@ SAM 3.1 ships with:
 
 - setup: `model_servers/sam3/setup.sh`
 - run script: `model_servers/sam3/run.sh`
-- endpoint: `ws://127.0.0.1:8101/v1/ws`
-- RPC method: `sam3.infer_video_text`
+- local endpoint: `ws://127.0.0.1:8101/v1/ws`
+- public endpoint: stored in Tunnelbroker metadata as `ws_endpoint`
+- inference RPC methods: `inference_sam3`, `sam3.infer_video_text`
+- training RPC method: `train_model` (currently reports not implemented for SAM3)
 
-The backend adapter points are:
+Main-backend model server management RPCs:
 
-- `run_sam3_video_text_inference` in
-  `samtoyolo_backend/executors/sam3_adapter.py`
-- SAM model-server implementation in
+- `get_model_server_list`
+- `get_model_server_status`
+- `setup_model_server`
+- `restart_model_server`
+
+Model-server implementation points:
+
+- SAM model-server API in
   `samtoyolo_model_servers/sam3/server.py`
 - official SAM runtime implementation in
   `samtoyolo_model_servers/sam3/inference.py`
-- `execute_inference_sam3` in `samtoyolo_backend/executors/inference.py`
-- `execute_inference_yolo` in `samtoyolo_backend/executors/inference.py`
-- `execute_train_model` in `samtoyolo_backend/executors/training.py`
 - upload/download logic in `samtoyolo_backend/executors/upload.py`
 - Mega mount/upload adapter logic in `samtoyolo_backend/handlers/mega_handlers.py`
 

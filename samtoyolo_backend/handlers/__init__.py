@@ -7,6 +7,7 @@ from . import inference_handlers as inference_handlers
 from . import info_handlers as info_handlers
 from . import mega_handlers as mega_handlers
 from . import model_handlers as model_handlers
+from . import model_server_handlers as model_server_handlers
 from . import project_handlers as project_handlers
 from . import training_handlers as training_handlers
 from . import tunnel_handlers as tunnel_handlers
@@ -20,6 +21,7 @@ __all__ = [
     "info_handlers",
     "mega_handlers",
     "model_handlers",
+    "model_server_handlers",
     "project_handlers",
     "training_handlers",
     "tunnel_handlers",

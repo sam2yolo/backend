@@ -14,15 +14,17 @@ On first run the backend checks for a conda environment named
 `requirements.txt`, and re-runs itself inside that environment. If conda is not
 installed, it installs Miniforge under `~/.samtoyolo/miniforge3`.
 
-Model runtimes are isolated into separate model servers. Start the SAM 3.1
-server in its own environment before running real SAM inference:
+Model runtimes are isolated into separate model servers. On backend startup,
+the main server can set up and start model servers, then publish their
+Cloudflare Tunnel endpoints to Tunnelbroker in remote mode. You can also start
+the SAM 3.1 model server manually:
 
 ```bash
 model_servers/sam3/run.sh
 ```
 
-The backend talks to that server through `SAMTOYOLO_SAM3_SERVER_URL`, which
-defaults to `ws://127.0.0.1:8101/v1/ws`.
+Clients should call inference and training methods on the model-server
+WebSocket endpoint returned by `models()` or `get_model_server_list()`.
 
 You can still call uvicorn directly:
 

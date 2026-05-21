@@ -18,7 +18,10 @@ async def handle_models(ctx: HandlerContext, params: object) -> dict[str, object
             model["model_download_url"] = ctx.settings.sam3_model_download_url
             model["model_file_id"] = google_drive_file_id(ctx.settings.sam3_model_url)
             model["model_filename"] = ctx.settings.sam3_model_filename
-            model["model_server_url"] = ctx.settings.sam3_model_server_url
+            model["model_server_url"] = ctx.app.state.model_server_manager.endpoint_for(
+                "sam3"
+            )
+            model["model_server"] = ctx.app.state.model_server_manager.status("sam3")
     return {
         "inference_models": inference_models,
         "training_models": TRAINING_MODELS,
