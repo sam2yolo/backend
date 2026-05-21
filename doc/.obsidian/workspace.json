@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Specifiaction.md",
+                "file": "API.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Specifiaction"
+              "title": "API"
             }
           }
         ]
@@ -185,8 +185,8 @@
   },
   "active": "c179897b4cae48b3",
   "lastOpenFiles": [
-    "API.md",
     "Specifiaction.md",
+    "API.md",
     "Untitled"
   ]
 }
