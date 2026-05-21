@@ -164,7 +164,7 @@ Result:
   "runtime_environment": {
     "bootstrap_enabled": true,
     "bootstrapped": true,
-    "conda_env_name": "samtoyolo-sam3",
+    "conda_env_name": "samtoyolo-backend",
     "in_conda_env": true
   }
 }
@@ -174,10 +174,11 @@ Result:
 
 #### `models()`
 
-Lists supported inference and training model names. SAM 3.1 is wired to the
-official `sam3` package for real CUDA inference. The SAM 3.1 entry includes
-`model_source_url`, `model_download_url`, `model_file_id`, and
-`model_filename`.
+Lists supported inference and training model names. SAM 3.1 is reached through
+an isolated model server so its CUDA/PyTorch/SAM dependencies do not pollute the
+backend environment. The SAM 3.1 entry includes `model_source_url`,
+`model_download_url`, `model_file_id`, `model_filename`, and
+`model_server_url`.
 
 Aliases: `list_models`
 
@@ -289,9 +290,10 @@ Notes:
 - By default, the backend downloads the configured SAM 3.1 zip model artifact
   to `SAMTOYOLO_MODEL_CACHE_DIR`, extracts it once, and reuses the extracted
   directory on later inference runs.
-- Real inference loads `sam3.1_multiplex.pt` from the extracted artifact using
-  the official `sam3` video predictor. The model is loaded on the task's
-  assigned GPU worker (`gpu_index`).
+- Real inference is sent to the configured SAM model server
+  (`model_server_url` or `SAMTOYOLO_SAM3_SERVER_URL`). That server loads
+  `sam3.1_multiplex.pt` from the extracted artifact using the official `sam3`
+  video predictor. The requested GPU is the task's assigned `gpu_index`.
 - Set `use_stub_inference=true` only for lightweight developer smoke tests.
 - Optional SAM runtime keys include `output_prob_thresh`,
   `confidence_threshold`, `include_masks`, `sam3_max_num_objects`,
@@ -573,13 +575,14 @@ Common variables:
 | `SAMTOYOLO_ALLOW_STUB_ML` | `true` | Allows stub inference/training artifacts before real adapters are installed. |
 | `SAMTOYOLO_SAM3_MODEL_URL` | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source. |
 | `SAMTOYOLO_SAM3_MODEL_FILENAME` | `sam3.1.zip` | Expected SAM 3.1 archive filename. |
+| `SAMTOYOLO_SAM3_SERVER_URL` | `ws://127.0.0.1:8101/v1/ws` | SAM 3.1 model server WebSocket endpoint. |
 | `SAMTOYOLO_MODEL_CACHE_DIR` | `{project_root}/_models` | Shared model artifact cache directory. |
-| `SAMTOYOLO_CONDA_BOOTSTRAP` | `true` | Create/re-enter the SAM conda environment on startup. |
-| `SAMTOYOLO_CONDA_ENV_NAME` | `samtoyolo-sam3` | Runtime conda environment name. |
+| `SAMTOYOLO_CONDA_BOOTSTRAP` | `true` | Create/re-enter the backend conda environment on startup. |
+| `SAMTOYOLO_CONDA_ENV_NAME` | `samtoyolo-backend` | Backend runtime conda environment name. |
 | `SAMTOYOLO_CONDA_PYTHON` | `3.12` | Python version used when creating the env. |
 | `SAMTOYOLO_CONDA_INSTALL_PREFIX` | `~/.samtoyolo/miniforge3` | Conda install path when conda is missing. |
-| `SAMTOYOLO_TORCH_INDEX_URL` | PyTorch CUDA 12.8 index | Torch wheel index used during bootstrap. |
-| `SAMTOYOLO_INSTALL_TORCH` | `true` | Install torch/torchvision before requirements. |
+| `SAMTOYOLO_TORCH_INDEX_URL` | PyTorch CUDA 12.8 index | Torch wheel index used by model-server setup scripts. |
+| `SAMTOYOLO_INSTALL_TORCH` | `false` | Optional legacy backend torch install. Model servers install their own torch. |
 | `SAMTOYOLO_REQUIREMENTS_FILE` | `requirements.txt` | Requirements file installed into the env. |
 | `TUNNELBROKER_URL` | unset | Peer registry base URL. |
 | `TUNNELBROKER_GROUP` | unset | Peer registry group. |
@@ -594,9 +597,9 @@ python -m samtoyolo_backend.run
 ```
 
 On first run, the backend checks for the configured conda environment. If it is
-missing, the backend creates it, installs a CUDA-enabled PyTorch build and the
-repository requirements, then re-execs itself inside that environment. If conda
-is not installed, Miniforge is installed first.
+missing, the backend creates it, installs the repository requirements, then
+re-execs itself inside that environment. If conda is not installed, Miniforge is
+installed first.
 
 Direct uvicorn startup is also supported and performs the same bootstrap:
 
@@ -614,14 +617,33 @@ TUNNELBROKER_PEER_SECRET=peer-owned-secret \
 uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Adapter Boundaries
+## Model Server Boundaries
 
-SAM 3.1 inference requires CUDA-enabled `torch`/`torchvision` and the official
-`sam3` package from GitHub. YOLO/training placeholders are still intentionally
-runnable without their large ML packages. The adapter points are:
+Each heavy model runs in a separate FastAPI model server with its own conda
+environment and WebSocket JSON-RPC endpoint. The backend keeps project state,
+task queues, frame extraction, result packaging, checkpoint events, and client
+sync. Model servers own CUDA runtimes and model-specific packages.
+
+In v1.0, model servers are intended to run on the same machine or a shared
+filesystem with the backend. The backend passes sampled frame directories and
+model-checkpoint directories by path. Remote model-server hosts should add a
+file-staging layer before inference.
+
+SAM 3.1 ships with:
+
+- setup: `model_servers/sam3/setup.sh`
+- run script: `model_servers/sam3/run.sh`
+- endpoint: `ws://127.0.0.1:8101/v1/ws`
+- RPC method: `sam3.infer_video_text`
+
+The backend adapter points are:
 
 - `run_sam3_video_text_inference` in
   `samtoyolo_backend/executors/sam3_adapter.py`
+- SAM model-server implementation in
+  `samtoyolo_model_servers/sam3/server.py`
+- official SAM runtime implementation in
+  `samtoyolo_model_servers/sam3/inference.py`
 - `execute_inference_sam3` in `samtoyolo_backend/executors/inference.py`
 - `execute_inference_yolo` in `samtoyolo_backend/executors/inference.py`
 - `execute_train_model` in `samtoyolo_backend/executors/training.py`

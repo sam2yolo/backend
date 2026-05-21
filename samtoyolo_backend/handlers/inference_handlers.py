@@ -63,6 +63,9 @@ async def handle_inference_sam3(ctx: HandlerContext, params: object) -> dict[str
             "model_download_url": model_download_url,
             "model_filename": model_filename,
             "model_cache_dir": str(ctx.settings.model_cache_dir),
+            "model_server_url": data.get(
+                "model_server_url", ctx.settings.sam3_model_server_url
+            ),
             "output_prob_thresh": data.get("output_prob_thresh"),
             "confidence_threshold": data.get("confidence_threshold"),
             "include_masks": data.get("include_masks", True),

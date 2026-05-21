@@ -6,9 +6,10 @@ INFERENCE_MODELS = [
         "name": "sam3",
         "display_name": "Meta SAM 3.1",
         "task_type": "segmentation",
-        "status": "official_sam3_adapter",
+        "status": "model_server_adapter",
         "text_prompt": True,
         "default_artifact": "sam3.1.zip",
+        "server_kind": "sam3",
     },
     {
         "name": "yolov8",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,9 @@ class Settings:
     sam3_model_filename: str = os.getenv(
         "SAMTOYOLO_SAM3_MODEL_FILENAME", DEFAULT_SAM3_MODEL_FILENAME
     )
+    sam3_model_server_url: str = os.getenv(
+        "SAMTOYOLO_SAM3_SERVER_URL", "ws://127.0.0.1:8101/v1/ws"
+    )
     instance_ttl_seconds: int = _int_env("SAMTOYOLO_INSTANCE_TTL_SECONDS", 42_600)
     expiry_notice_seconds: int = _int_env("SAMTOYOLO_EXPIRY_NOTICE_SECONDS", 900)
     public_base_url: str | None = os.getenv("SAMTOYOLO_PUBLIC_BASE_URL")
@@ -76,5 +80,17 @@ class Settings:
 
             count = torch.cuda.device_count()
             return max(1, int(count))
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--list-gpus"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            count = len([line for line in result.stdout.splitlines() if line.strip()])
+            return max(1, count)
         except Exception:
             return 1

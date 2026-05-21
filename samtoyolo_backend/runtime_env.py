@@ -14,7 +14,7 @@ from typing import Any
 
 BOOTSTRAP_ENV_VAR = "SAMTOYOLO_CONDA_BOOTSTRAP"
 BOOTSTRAPPED_ENV_VAR = "SAMTOYOLO_CONDA_BOOTSTRAPPED"
-DEFAULT_ENV_NAME = "samtoyolo-sam3"
+DEFAULT_ENV_NAME = "samtoyolo-backend"
 DEFAULT_PYTHON_VERSION = "3.12"
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 MINIFORGE_URLS = {
@@ -142,7 +142,7 @@ def _ensure_env_packages(
         "requirements_file": str(_requirements_path(repo_root)),
         "requirements_hash": _file_hash(_requirements_path(repo_root)),
         "torch_index_url": os.getenv("SAMTOYOLO_TORCH_INDEX_URL", DEFAULT_TORCH_INDEX_URL),
-        "install_torch": _bool_env("SAMTOYOLO_INSTALL_TORCH", True),
+        "install_torch": _bool_env("SAMTOYOLO_INSTALL_TORCH", False),
     }
     if all(marker.get(key) == value for key, value in wanted.items()):
         return

@@ -118,6 +118,7 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
 
         sam3_result = await asyncio.to_thread(
             run_sam3_video_text_inference,
+            server_url=str(params["model_server_url"]),
             frames_dir=frames_dir,
             frames=frames,
             prompts=prompts,
