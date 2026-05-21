@@ -10,10 +10,29 @@ if [[ "${SAMTOYOLO_SKIP_MODEL_SERVER_SETUP:-0}" != "1" ]]; then
   "${SCRIPT_DIR}/setup.sh"
 fi
 
-CONDA_BIN="${CONDA_EXE:-${CONDA_PREFIX_ROOT}/bin/conda}"
-if [[ ! -x "${CONDA_BIN}" ]]; then
-  CONDA_BIN="$(command -v conda)"
-fi
+find_conda() {
+  if [[ -n "${CONDA_EXE:-}" && -x "${CONDA_EXE}" ]]; then
+    printf '%s\n' "${CONDA_EXE}"
+    return 0
+  fi
+  if command -v conda >/dev/null 2>&1; then
+    command -v conda
+    return 0
+  fi
+  for candidate in \
+    "${CONDA_PREFIX_ROOT}/bin/conda" \
+    "${HOME}/miniforge3/bin/conda" \
+    "${HOME}/miniconda3/bin/conda" \
+    "/opt/conda/bin/conda"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+CONDA_BIN="$(find_conda)"
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 exec "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" \
