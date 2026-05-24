@@ -148,6 +148,11 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
             ),
             include_masks=_bool_param(params, "include_masks", True),
             output_mode=output_mode,
+            inference_backend=str(
+                params.get("inference_backend")
+                or params.get("sam3_backend")
+                or "video"
+            ),
             progress=sam3_progress,
             is_cancelled=ctx.is_cancelled,
             progress_start=progress_start,
@@ -195,6 +200,9 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
             "batch_size": batch_size,
             "max_batch_size": 4,
             "output_mode": output_mode,
+            "inference_backend": params.get("inference_backend")
+            or params.get("sam3_backend")
+            or "video",
             "sample_interval_seconds": params.get("sample_interval_seconds"),
             "sample_strategy": params.get("sample_strategy"),
             "max_frames": params.get("max_frames"),

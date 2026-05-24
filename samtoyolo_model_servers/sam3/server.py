@@ -15,7 +15,10 @@ from samtoyolo_model_servers.common.jsonrpc import (
     error_response,
     require_object,
 )
-from samtoyolo_model_servers.sam3.inference import run_sam3_video_text_inference
+from samtoyolo_model_servers.sam3.inference import (
+    run_sam3_image_text_inference,
+    run_sam3_video_text_inference,
+)
 
 
 def create_app() -> FastAPI:
@@ -111,8 +114,13 @@ async def _infer_video_text(websocket: WebSocket, params: dict[str, Any]) -> dic
         )
         future.result()
 
-    result = await asyncio.to_thread(
-        run_sam3_video_text_inference,
+    backend = str(data.get("inference_backend") or data.get("sam3_backend") or "video")
+    runner = (
+        run_sam3_image_text_inference
+        if backend.strip().lower() in {"image", "frame", "per_frame", "image_processor"}
+        else run_sam3_video_text_inference
+    )
+    common = dict(
         frames_dir=Path(str(data["frames_dir"])),
         frames=[Path(str(frame)) for frame in data.get("frames", [])],
         prompts=[str(prompt) for prompt in data.get("prompts", [])],
@@ -123,22 +131,30 @@ async def _infer_video_text(websocket: WebSocket, params: dict[str, Any]) -> dic
         model_extract_dir=Path(str(data["model_extract_dir"])),
         gpu_index=data.get("gpu_index"),
         output_prob_thresh=float(data.get("output_prob_thresh", 0.5)),
-        max_num_objects=max(1, int(data.get("max_num_objects", 16))),
-        multiplex_count=max(1, int(data.get("multiplex_count", 16))),
-        use_fa3=bool(data.get("use_fa3", False)),
-        compile_model=bool(data.get("compile_model", False)),
-        warm_up=bool(data.get("warm_up", False)),
-        async_loading_frames=bool(data.get("async_loading_frames", False)),
-        offload_video_to_cpu=bool(data.get("offload_video_to_cpu", True)),
-        offload_state_to_cpu=bool(data.get("offload_state_to_cpu", False)),
         cache_model=bool(data.get("cache_model", True)),
-        allow_partial_checkpoint=bool(data.get("allow_partial_checkpoint", False)),
         include_masks=bool(data.get("include_masks", True)),
         output_mode=str(data.get("output_mode") or "both"),
         progress=progress,
         progress_start=float(data.get("progress_start", 0.0)),
         progress_end=float(data.get("progress_end", 100.0)),
     )
+    if runner is run_sam3_video_text_inference:
+        common.update(
+            max_num_objects=max(1, int(data.get("max_num_objects", 16))),
+            multiplex_count=max(1, int(data.get("multiplex_count", 16))),
+            use_fa3=bool(data.get("use_fa3", False)),
+            compile_model=bool(data.get("compile_model", False)),
+            warm_up=bool(data.get("warm_up", False)),
+            async_loading_frames=bool(data.get("async_loading_frames", False)),
+            offload_video_to_cpu=bool(data.get("offload_video_to_cpu", True)),
+            offload_state_to_cpu=bool(data.get("offload_state_to_cpu", False)),
+            allow_partial_checkpoint=bool(data.get("allow_partial_checkpoint", False)),
+        )
+    else:
+        common.update(
+            force_fp32_bfloat16=bool(data.get("force_fp32_bfloat16", True)),
+        )
+    result = await asyncio.to_thread(runner, **common)
     return {"frames": result.frames, "metadata": result.metadata}
 
 

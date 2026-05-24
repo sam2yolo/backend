@@ -41,6 +41,7 @@ class _PredictorKey:
 _PREDICTOR_CACHE: dict[_PredictorKey, Any] = {}
 _PREDICTOR_LOCKS: dict[_PredictorKey, threading.Lock] = {}
 _CACHE_LOCK = threading.Lock()
+_IMAGE_PROCESSOR_CACHE: dict[tuple[str, int, float, bool], Any] = {}
 
 
 def run_sam3_video_text_inference(
@@ -239,6 +240,179 @@ def run_sam3_video_text_inference(
             "sam3_real_inference": True,
         },
     )
+
+
+def run_sam3_image_text_inference(
+    *,
+    frames_dir: Path,
+    frames: list[Path],
+    prompts: list[str],
+    prompt_to_class: dict[str, str],
+    model_extract_dir: Path,
+    gpu_index: int | None,
+    output_prob_thresh: float = 0.5,
+    include_masks: bool = True,
+    output_mode: str = "both",
+    cache_model: bool = True,
+    force_fp32_bfloat16: bool = True,
+    progress: ProgressCallback | None = None,
+    is_cancelled: CancelChecker | None = None,
+    progress_start: float = 12.0,
+    progress_end: float = 88.0,
+) -> Sam3InferenceResult:
+    """Run official SAM 3.1 image text processor on each sampled frame."""
+
+    output = _normalise_output_mode(output_mode, include_masks=include_masks)
+    rows = _empty_annotation_rows(frames)
+    if not frames or not prompts:
+        return Sam3InferenceResult(
+            frames=rows,
+            metadata={
+                "sam3_backend": "official_sam3_image_processor",
+                "sam3_skipped": "no frames or prompts",
+            },
+        )
+
+    checkpoint_path = find_sam3_checkpoint(model_extract_dir)
+    gpu_id = _select_cuda_device(gpu_index)
+    _progress(
+        progress,
+        progress_start,
+        f"loading SAM 3.1 image processor on gpu-{gpu_id}",
+        {"gpu_index": gpu_id, "checkpoint_path": str(checkpoint_path)},
+    )
+    processor = _get_image_processor(
+        checkpoint_path=checkpoint_path,
+        gpu_index=gpu_id,
+        output_prob_thresh=output_prob_thresh,
+        cache_model=cache_model,
+        force_fp32_bfloat16=force_fp32_bfloat16,
+    )
+    completed = 0
+    total = max(1, len(frames) * len(prompts))
+    try:
+        from PIL import Image
+
+        for frame_index, frame_path in enumerate(frames):
+            _raise_if_cancelled(is_cancelled)
+            image = Image.open(frame_path).convert("RGB")
+            state = processor.set_image(image)
+            for prompt_index, prompt in enumerate(prompts):
+                _raise_if_cancelled(is_cancelled)
+                if hasattr(processor, "reset_all_prompts"):
+                    processor.reset_all_prompts(state)
+                state = processor.set_text_prompt(prompt=prompt, state=state)
+                _replace_prompt_objects(
+                    rows=rows,
+                    frame_index=frame_index,
+                    outputs=_image_outputs(state),
+                    prompt=prompt,
+                    prompt_index=prompt_index,
+                    class_name=prompt_to_class.get(prompt, prompt),
+                    include_masks=include_masks,
+                    output_mode=output,
+                )
+                completed += 1
+                _progress(
+                    progress,
+                    _interpolate(progress_start, progress_end, completed, total),
+                    (
+                        f"SAM image prompt {prompt_index + 1}/{len(prompts)} "
+                        f"frame {frame_index + 1}/{len(frames)}"
+                    ),
+                    {"gpu_index": gpu_id, "prompt": prompt, "frame_index": frame_index},
+                )
+    finally:
+        gc.collect()
+
+    object_count = sum(len(row.get("objects", [])) for row in rows)
+    _progress(
+        progress,
+        progress_end,
+        f"SAM 3.1 image inference produced {object_count} objects",
+        {"gpu_index": gpu_id, "object_count": object_count},
+    )
+    return Sam3InferenceResult(
+        frames=rows,
+        metadata={
+            "sam3_backend": "official_sam3_image_processor",
+            "sam3_checkpoint_path": str(checkpoint_path),
+            "sam3_gpu_index": gpu_id,
+            "sam3_output_prob_thresh": output_prob_thresh,
+            "sam3_output_mode": output,
+            "sam3_force_fp32_bfloat16": force_fp32_bfloat16,
+            "sam3_model_cached": cache_model,
+            "sam3_object_count": object_count,
+            "sam3_real_inference": True,
+        },
+    )
+
+
+def _get_image_processor(
+    *,
+    checkpoint_path: Path,
+    gpu_index: int,
+    output_prob_thresh: float,
+    cache_model: bool,
+    force_fp32_bfloat16: bool,
+) -> Any:
+    key = (
+        str(checkpoint_path.resolve()),
+        gpu_index,
+        float(output_prob_thresh),
+        bool(force_fp32_bfloat16),
+    )
+    if cache_model and key in _IMAGE_PROCESSOR_CACHE:
+        return _IMAGE_PROCESSOR_CACHE[key]
+    try:
+        import torch
+        from sam3.model.sam3_image_processor import Sam3Processor
+        from sam3.model_builder import build_sam3_image_model
+    except Exception as exc:
+        raise Sam3AdapterError(
+            "SAM 3.1 image inference requires the official sam3 package."
+        ) from exc
+
+    if not torch.cuda.is_available():
+        raise Sam3AdapterError("SAM 3.1 image inference requires a CUDA GPU")
+    torch.cuda.set_device(gpu_index)
+    model = build_sam3_image_model(
+        checkpoint_path=str(checkpoint_path),
+        load_from_HF=False,
+        device="cuda",
+        compile=False,
+    ).float()
+    if force_fp32_bfloat16:
+        # T4 and other pre-Ampere cards do not handle SAM3's hard-coded BF16 path.
+        torch.bfloat16 = torch.float32
+    processor = Sam3Processor(
+        model,
+        confidence_threshold=output_prob_thresh,
+        device="cuda",
+    )
+    if cache_model:
+        _IMAGE_PROCESSOR_CACHE[key] = processor
+    return processor
+
+
+def _image_outputs(state: dict[str, Any]) -> dict[str, Any]:
+    boxes_xyxy = _to_list(state.get("boxes"))
+    masks = _normalise_masks(state.get("masks"))
+    scores = _to_list(state.get("scores"))
+    return {
+        "boxes": [_xyxy_to_xywh(box) for box in boxes_xyxy],
+        "masks": masks,
+        "scores": scores,
+        "obj_ids": list(range(max(len(boxes_xyxy), len(masks), len(scores)))),
+    }
+
+
+def _xyxy_to_xywh(box: Any) -> list[float] | None:
+    values = [_as_float(value) for value in _to_list(box)]
+    if len(values) < 4 or any(value is None for value in values[:4]):
+        return None
+    x0, y0, x1, y1 = [float(value) for value in values[:4]]
+    return [x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0)]
 
 
 def find_sam3_checkpoint(model_extract_dir: Path) -> Path:
