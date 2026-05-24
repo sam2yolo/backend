@@ -134,6 +134,7 @@ async def _infer_video_text(websocket: WebSocket, params: dict[str, Any]) -> dic
         cache_model=bool(data.get("cache_model", True)),
         allow_partial_checkpoint=bool(data.get("allow_partial_checkpoint", False)),
         include_masks=bool(data.get("include_masks", True)),
+        output_mode=str(data.get("output_mode") or "both"),
         progress=progress,
         progress_start=float(data.get("progress_start", 0.0)),
         progress_end=float(data.get("progress_end", 100.0)),

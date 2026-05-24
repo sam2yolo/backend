@@ -63,6 +63,7 @@ def run_sam3_video_text_inference(
     cache_model: bool = True,
     allow_partial_checkpoint: bool = False,
     include_masks: bool = True,
+    output_mode: str = "both",
     progress: ProgressCallback | None = None,
     is_cancelled: CancelChecker | None = None,
     progress_start: float = 12.0,
@@ -70,6 +71,7 @@ def run_sam3_video_text_inference(
 ) -> Sam3InferenceResult:
     """Run official SAM 3.1 video predictor on sampled frames with text prompts."""
 
+    output = _normalise_output_mode(output_mode, include_masks=include_masks)
     rows = _empty_annotation_rows(frames)
     if not frames or not prompts:
         return Sam3InferenceResult(
@@ -155,6 +157,7 @@ def run_sam3_video_text_inference(
                 prompt_index=prompt_index,
                 class_name=class_name,
                 include_masks=include_masks,
+                output_mode=output,
             )
 
             for stream_response in predictor.handle_stream_request(
@@ -176,6 +179,7 @@ def run_sam3_video_text_inference(
                     prompt_index=prompt_index,
                     class_name=class_name,
                     include_masks=include_masks,
+                    output_mode=output,
                 )
                 completed_stream_steps += 1
                 if completed_stream_steps % max(1, len(frames) // 8) == 0:
@@ -230,6 +234,7 @@ def run_sam3_video_text_inference(
             "sam3_async_loading_frames": async_loading_frames,
             "sam3_model_cached": cache_model,
             "sam3_allow_partial_checkpoint": allow_partial_checkpoint,
+            "sam3_output_mode": output,
             "sam3_object_count": object_count,
             "sam3_real_inference": True,
         },
@@ -523,6 +528,7 @@ def _replace_prompt_objects(
     prompt_index: int,
     class_name: str,
     include_masks: bool,
+    output_mode: str,
 ) -> None:
     if frame_index < 0 or frame_index >= len(rows):
         return
@@ -543,6 +549,7 @@ def _replace_prompt_objects(
             width=width,
             height=height,
             include_masks=include_masks,
+            output_mode=output_mode,
         )
     )
 
@@ -556,7 +563,10 @@ def _objects_from_outputs(
     width: int,
     height: int,
     include_masks: bool,
+    output_mode: str,
 ) -> list[dict[str, Any]]:
+    include_boxes = output_mode in {"bbox", "both"}
+    include_segmentations = output_mode in {"segmentation", "both"} and include_masks
     obj_ids = _to_list(_first_present(outputs, "out_obj_ids", "obj_ids"))
     boxes = _to_list(_first_present(outputs, "out_boxes_xywh", "boxes"))
     scores = _to_list(_first_present(outputs, "out_probs", "scores"))
@@ -585,14 +595,38 @@ def _objects_from_outputs(
             "prompt": prompt,
             "class_name": class_name,
             "confidence": float(score) if score is not None else None,
-            "bbox": [round(value, 3) for value in bbox],
-            "bbox_format": "xywh_abs",
         }
-        if include_masks and mask is not None:
+        if include_boxes:
+            obj["bbox"] = [round(value, 3) for value in bbox]
+            obj["bbox_format"] = "xywh_abs"
+        if include_segmentations and mask is not None:
             obj["segmentation"] = _rle_from_mask(mask)
             obj["area"] = int(_mask_area(mask))
         objects.append(obj)
     return objects
+
+
+def _normalise_output_mode(value: str, *, include_masks: bool) -> str:
+    mode = (value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "box": "bbox",
+        "boxes": "bbox",
+        "bounding_box": "bbox",
+        "bounding_boxes": "bbox",
+        "mask": "segmentation",
+        "masks": "segmentation",
+        "segments": "segmentation",
+        "segmentations": "segmentation",
+        "bbox_and_segmentation": "both",
+        "segmentation_and_bbox": "both",
+        "all": "both",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"bbox", "segmentation", "both"}:
+        mode = "both" if include_masks else "bbox"
+    if mode == "segmentation" and not include_masks:
+        return "bbox"
+    return mode
 
 
 def _to_list(value: Any) -> list[Any]:
