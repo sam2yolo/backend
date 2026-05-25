@@ -216,6 +216,31 @@ curl -X POST \
   "https://main-example.trycloudflare.com/v1/projects/cctv-demo/uploads/video"
 ```
 
+When uploading through Cloudflare Tunnel, keep each HTTP request below the
+provider upload limit. For large videos, use the chunked upload endpoints:
+
+```bash
+curl -X POST \
+  -H "content-type: application/json" \
+  -d '{"filename":"cctv.dav","size_bytes":104857600}' \
+  "https://main-example.trycloudflare.com/v1/projects/cctv-demo/uploads/video/chunked/init"
+```
+
+Upload chunks to:
+
+```text
+/v1/projects/cctv-demo/uploads/video/chunked/{upload_id}/chunks/{chunk_index}
+```
+
+Then finalize:
+
+```bash
+curl -X POST \
+  -H "content-type: application/json" \
+  -d '{"filename":"cctv.dav","chunk_count":13,"size_bytes":104857600}' \
+  "https://main-example.trycloudflare.com/v1/projects/cctv-demo/uploads/video/chunked/{upload_id}/complete"
+```
+
 Example result:
 
 ```json

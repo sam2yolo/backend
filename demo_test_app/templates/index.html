@@ -150,6 +150,31 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
+    .submit-progress {
+      display: none;
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #f8fafc;
+    }
+    .submit-progress.visible { display: block; }
+    .submit-progress strong {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .error {
+      display: none;
+      margin-top: 12px;
+      color: #991b1b;
+      background: #fee2e2;
+      border: 1px solid #fecaca;
+      border-radius: 6px;
+      padding: 10px;
+      white-space: pre-wrap;
+    }
+    .error.visible { display: block; }
     @media (max-width: 980px) {
       form, .grid, .grid.three, .source-row { grid-template-columns: 1fr; }
     }
@@ -161,7 +186,7 @@
     <span>Flask client for Tunnelbroker, backend, SAM3, and result download</span>
   </header>
   <main>
-    <form action="/jobs" method="post" enctype="multipart/form-data">
+    <form id="testForm" action="/jobs" method="post" enctype="multipart/form-data">
       <div>
         <section>
           <h2>Connection</h2>
@@ -215,6 +240,15 @@
               <input name="video_file" type="file" accept="video/*,.dav,.mp4,.mov,.avi,.mkv">
             </label>
           </div>
+          <label style="margin-top:12px;">Reuse Existing Local Upload
+            <select name="existing_upload">
+              <option value="">Do not reuse</option>
+              {% for upload in existing_uploads %}
+                <option value="{{ upload.name }}">{{ upload.name }} ({{ upload.size_bytes }} bytes)</option>
+              {% endfor %}
+            </select>
+          </label>
+          <p class="note">For repeated local-file tests, choose a previous upload to skip the browser-to-Flask upload step.</p>
         </section>
 
         <section>
@@ -325,7 +359,13 @@ Dog=dog</textarea>
           </div>
         </section>
 
-        <button class="submit" type="submit">Start Full Test</button>
+        <button class="submit" id="submitButton" type="submit">Start Full Test</button>
+        <div class="submit-progress" id="submitProgress">
+          <strong><span>Preparing job</span><span id="submitPercent">0%</span></strong>
+          <div class="bar"><span id="submitBar"></span></div>
+          <p class="note" id="submitMessage">Uploading form data to the Flask demo app.</p>
+        </div>
+        <div class="error" id="submitError"></div>
       </div>
     </form>
   </main>
@@ -340,6 +380,61 @@ Dog=dog</textarea>
       button.addEventListener("click", () => {
         document.querySelector("#prompts").value = presets[button.dataset.preset];
       });
+    });
+
+    const form = document.querySelector("#testForm");
+    const submitButton = document.querySelector("#submitButton");
+    const submitProgress = document.querySelector("#submitProgress");
+    const submitPercent = document.querySelector("#submitPercent");
+    const submitBar = document.querySelector("#submitBar");
+    const submitMessage = document.querySelector("#submitMessage");
+    const submitError = document.querySelector("#submitError");
+
+    function setSubmitProgress(percent, message) {
+      submitProgress.classList.add("visible");
+      submitPercent.textContent = `${percent.toFixed(1)}%`;
+      submitBar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+      submitMessage.textContent = message;
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitError.classList.remove("visible");
+      submitError.textContent = "";
+      submitButton.disabled = true;
+      submitButton.textContent = "Starting...";
+      setSubmitProgress(0, "Uploading request to the Flask demo app.");
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", form.action);
+      xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+      xhr.upload.addEventListener("progress", (uploadEvent) => {
+        if (uploadEvent.lengthComputable) {
+          const percent = (uploadEvent.loaded / uploadEvent.total) * 100;
+          setSubmitProgress(percent, `Browser upload ${uploadEvent.loaded}/${uploadEvent.total} bytes`);
+        } else {
+          setSubmitProgress(5, `Browser upload ${uploadEvent.loaded} bytes`);
+        }
+      });
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const payload = JSON.parse(xhr.responseText);
+          setSubmitProgress(100, "Job created. Opening live progress page.");
+          window.location.href = payload.url;
+          return;
+        }
+        submitButton.disabled = false;
+        submitButton.textContent = "Start Full Test";
+        submitError.textContent = xhr.responseText || `Request failed with HTTP ${xhr.status}`;
+        submitError.classList.add("visible");
+      });
+      xhr.addEventListener("error", () => {
+        submitButton.disabled = false;
+        submitButton.textContent = "Start Full Test";
+        submitError.textContent = "Could not submit the job. Check whether the Flask app is still running.";
+        submitError.classList.add("visible");
+      });
+      xhr.send(new FormData(form));
     });
   </script>
 </body>

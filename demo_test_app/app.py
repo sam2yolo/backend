@@ -10,7 +10,6 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urljoin
 
 import httpx
 import websockets
@@ -31,6 +30,9 @@ UPLOAD_DIR = APP_ROOT / "uploads"
 DOWNLOAD_DIR = APP_ROOT / "downloads"
 DEFAULT_BROKER_URL = "https://tunnelbroker.sam2yolo.workers.dev"
 FINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
+DEFAULT_CHUNK_SIZE_BYTES = int(
+    os.getenv("SAMTOYOLO_DEMO_CHUNK_SIZE_BYTES", str(8 * 1024 * 1024))
+)
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -197,6 +199,7 @@ def index() -> str:
         "index.html",
         default_broker_url=DEFAULT_BROKER_URL,
         default_project_id=f"demo-{int(time.time())}",
+        existing_uploads=_existing_uploads(),
     )
 
 
@@ -207,8 +210,14 @@ def create_job() -> Response:
     JOBS[job_id] = job
 
     uploaded_file = request.files.get("video_file")
+    existing_upload = request.form.get("existing_upload") or ""
     upload_path: str | None = None
-    if uploaded_file and uploaded_file.filename:
+    if existing_upload:
+        existing_path = (UPLOAD_DIR / Path(existing_upload).name).resolve()
+        if existing_path.parent != UPLOAD_DIR.resolve() or not existing_path.exists():
+            return _job_create_error("selected existing upload was not found")
+        upload_path = str(existing_path)
+    elif uploaded_file and uploaded_file.filename:
         target = UPLOAD_DIR / f"{job_id}-{Path(uploaded_file.filename).name}"
         uploaded_file.save(target)
         upload_path = str(target)
@@ -218,6 +227,8 @@ def create_job() -> Response:
     job.state["config"] = _safe_config(form)
     thread = threading.Thread(target=_run_job_thread, args=(job, form), daemon=True)
     thread.start()
+    if _wants_json():
+        return jsonify({"job_id": job_id, "url": url_for("job_page", job_id=job_id)})
     return redirect(url_for("job_page", job_id=job_id))
 
 
@@ -262,6 +273,11 @@ def download_file(job_id: str, filename: str) -> Response:
         if item.get("filename") == filename:
             return send_file(item["path"], as_attachment=True, download_name=filename)
     return Response("download not found", status=404)
+
+
+@app.get("/api/uploads")
+def list_uploads() -> Response:
+    return jsonify({"uploads": _existing_uploads()})
 
 
 def _run_job_thread(job: DemoJob, form: dict[str, str]) -> None:
@@ -444,6 +460,20 @@ def _upload_file_sync(
     path: Path,
     progress: Callable[[int, int], None],
 ) -> dict[str, Any]:
+    try:
+        return _upload_file_chunked_sync(backend_http, project_id, path, progress)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return _upload_file_single_request_sync(backend_http, project_id, path, progress)
+
+
+def _upload_file_single_request_sync(
+    backend_http: str,
+    project_id: str,
+    path: Path,
+    progress: Callable[[int, int], None],
+) -> dict[str, Any]:
     boundary = f"----samtoyolo-demo-{uuid.uuid4().hex}"
     stream = MultipartUploadStream(path, "file", boundary, progress)
     headers = {
@@ -455,6 +485,48 @@ def _upload_file_sync(
         response = client.post(url, content=stream, headers=headers)
         response.raise_for_status()
         return response.json()
+
+
+def _upload_file_chunked_sync(
+    backend_http: str,
+    project_id: str,
+    path: Path,
+    progress: Callable[[int, int], None],
+) -> dict[str, Any]:
+    base = backend_http.rstrip("/")
+    file_size = path.stat().st_size
+    chunk_size = max(1024 * 1024, DEFAULT_CHUNK_SIZE_BYTES)
+    chunk_count = max(1, (file_size + chunk_size - 1) // chunk_size)
+    with httpx.Client(timeout=None) as client:
+        init = client.post(
+            f"{base}/v1/projects/{project_id}/uploads/video/chunked/init",
+            json={"filename": path.name, "size_bytes": file_size},
+        )
+        init.raise_for_status()
+        upload_id = init.json()["upload_id"]
+
+        sent = 0
+        with path.open("rb") as handle:
+            for chunk_index in range(chunk_count):
+                data = handle.read(chunk_size)
+                response = client.post(
+                    (
+                        f"{base}/v1/projects/{project_id}/uploads/video/chunked/"
+                        f"{upload_id}/chunks/{chunk_index}"
+                    ),
+                    files={"chunk": (f"{chunk_index:08d}.part", data, "application/octet-stream")},
+                )
+                response.raise_for_status()
+                sent += len(data)
+                progress(sent, file_size)
+
+        complete = client.post(
+            f"{base}/v1/projects/{project_id}/uploads/video/chunked/{upload_id}/complete",
+            json={"filename": path.name, "chunk_count": chunk_count, "size_bytes": file_size},
+        )
+        complete.raise_for_status()
+        progress(file_size, file_size)
+        return complete.json()
 
 
 async def _wait_for_task(
@@ -632,6 +704,34 @@ def _extract_task_id(result: Any) -> str | None:
 def _safe_config(form: dict[str, str]) -> dict[str, str]:
     hidden = {"group_token"}
     return {key: ("<redacted>" if key in hidden and value else value) for key, value in form.items()}
+
+
+def _existing_uploads() -> list[dict[str, Any]]:
+    rows = []
+    for path in sorted(UPLOAD_DIR.glob("*"), key=lambda item: item.stat().st_mtime, reverse=True):
+        if not path.is_file():
+            continue
+        rows.append(
+            {
+                "name": path.name,
+                "size_bytes": path.stat().st_size,
+                "updated_at": path.stat().st_mtime,
+            }
+        )
+    return rows[:50]
+
+
+def _wants_json() -> bool:
+    return (
+        request.headers.get("x-requested-with") == "XMLHttpRequest"
+        or "application/json" in request.headers.get("accept", "")
+    )
+
+
+def _job_create_error(message: str) -> Response:
+    if _wants_json():
+        return jsonify({"error": message}), 400
+    return Response(message, status=400)
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:

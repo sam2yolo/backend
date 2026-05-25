@@ -8,6 +8,8 @@ It can:
 - discover backend/model-server peers from Tunnelbroker,
 - create a project,
 - upload a local video with upload progress,
+- forward local videos to the remote backend using chunked HTTP uploads to avoid
+  Cloudflare `413 Payload Too Large` limits,
 - import a Google Drive video and show backend task progress,
 - configure SAM3 model-server setup,
 - run the configured SAM3 inference request,
