@@ -13,6 +13,9 @@ from .model_sources import (
 )
 
 
+DEFAULT_TUNNELBROKER_URL = "https://tunnelbroker.sam2yolo.workers.dev"
+
+
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -54,7 +57,9 @@ class Settings:
     expiry_notice_seconds: int = _int_env("SAMTOYOLO_EXPIRY_NOTICE_SECONDS", 900)
     public_base_url: str | None = os.getenv("SAMTOYOLO_PUBLIC_BASE_URL")
 
-    tunnelbroker_url: str | None = os.getenv("TUNNELBROKER_URL")
+    tunnelbroker_url: str | None = os.getenv(
+        "TUNNELBROKER_URL", DEFAULT_TUNNELBROKER_URL
+    )
     tunnelbroker_group: str | None = os.getenv("TUNNELBROKER_GROUP")
     tunnelbroker_group_token: str | None = os.getenv("TUNNELBROKER_GROUP_TOKEN")
     peer_secret: str | None = os.getenv("TUNNELBROKER_PEER_SECRET")

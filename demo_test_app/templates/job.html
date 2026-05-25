@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inference Test Job {{ job_id }}</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #667085;
+      --line: #d8dee8;
+      --panel: #ffffff;
+      --bg: #f4f7fb;
+      --blue: #2563eb;
+      --green: #059669;
+      --red: #dc2626;
+      --amber: #b45309;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      padding: 18px 24px;
+      background: #111827;
+      color: white;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+    }
+    h1 { margin: 0; font-size: 20px; }
+    main {
+      padding: 20px;
+      max-width: 1320px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 0.78fr) minmax(420px, 1fr);
+      gap: 16px;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    h2 { margin: 0 0 12px; font-size: 15px; }
+    .progress-grid { display: grid; gap: 10px; }
+    .stage {
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .stage strong {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      text-transform: capitalize;
+    }
+    .bar { height: 10px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
+    .bar span { display: block; height: 100%; width: 0; background: var(--green); transition: width .2s ease; }
+    .msg { margin-top: 7px; color: var(--muted); font-size: 12px; min-height: 17px; }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      color: #e5e7eb;
+      border-radius: 6px;
+      padding: 12px;
+      max-height: 520px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .log {
+      display: grid;
+      gap: 8px;
+      max-height: 680px;
+      overflow: auto;
+    }
+    .entry {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: white;
+      padding: 9px;
+    }
+    .entry strong {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      color: #344054;
+      margin-bottom: 4px;
+    }
+    .entry code {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 9px;
+      background: #e0ecff;
+      color: #1d4ed8;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .downloads { display: grid; gap: 8px; }
+    a.button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      text-decoration: none;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: var(--blue);
+      color: white;
+      font-weight: 700;
+      width: fit-content;
+    }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Inference Test Job {{ job_id }}</h1>
+    <span class="pill" id="overall">running</span>
+  </header>
+  <main>
+    <div>
+      <section>
+        <h2>Progress</h2>
+        <div class="progress-grid" id="progress"></div>
+      </section>
+      <section>
+        <h2>Downloads</h2>
+        <div class="downloads" id="downloads">No downloads yet.</div>
+      </section>
+      <section>
+        <h2>Current State</h2>
+        <pre id="state">{{ state | tojson(indent=2) }}</pre>
+      </section>
+    </div>
+    <section>
+      <h2>Live Events</h2>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+  <script>
+    const jobId = {{ job_id | tojson }};
+    const progressEl = document.querySelector("#progress");
+    const logEl = document.querySelector("#log");
+    const stateEl = document.querySelector("#state");
+    const downloadsEl = document.querySelector("#downloads");
+    const overallEl = document.querySelector("#overall");
+    const stages = ["discover", "project", "upload", "model_setup", "model", "inference", "download"];
+
+    function renderProgress(progress) {
+      progressEl.innerHTML = "";
+      stages.forEach((stage) => {
+        const item = progress && progress[stage] ? progress[stage] : { percent: 0, message: "" };
+        const percent = Number(item.percent || 0).toFixed(1);
+        const div = document.createElement("div");
+        div.className = "stage";
+        div.innerHTML = `
+          <strong><span>${stage.replace("_", " ")}</span><span>${percent}%</span></strong>
+          <div class="bar"><span style="width:${percent}%"></span></div>
+          <div class="msg"></div>
+        `;
+        div.querySelector(".msg").textContent = item.message || "";
+        progressEl.appendChild(div);
+      });
+    }
+
+    function addLog(eventName, payload) {
+      const div = document.createElement("div");
+      div.className = "entry";
+      const when = payload.at ? new Date(payload.at * 1000).toLocaleTimeString() : new Date().toLocaleTimeString();
+      div.innerHTML = `<strong><span>${eventName}</span><span>${when}</span></strong><code></code>`;
+      div.querySelector("code").textContent = JSON.stringify(payload, null, 2);
+      logEl.prepend(div);
+    }
+
+    function renderDownloads(downloads) {
+      if (!downloads || downloads.length === 0) {
+        downloadsEl.textContent = "No downloads yet.";
+        return;
+      }
+      downloadsEl.innerHTML = "";
+      downloads.forEach((item) => {
+        const a = document.createElement("a");
+        a.className = "button";
+        a.href = item.url;
+        a.textContent = `${item.filename} (${item.size_bytes || 0} bytes)`;
+        downloadsEl.appendChild(a);
+      });
+    }
+
+    function renderState(state) {
+      stateEl.textContent = JSON.stringify(state, null, 2);
+      renderProgress(state.progress || {});
+      renderDownloads(state.downloads || []);
+      if (state.ok === true) {
+        overallEl.textContent = "complete";
+        overallEl.style.background = "#dcfce7";
+        overallEl.style.color = "#166534";
+      } else if (state.ok === false) {
+        overallEl.textContent = "failed";
+        overallEl.style.background = "#fee2e2";
+        overallEl.style.color = "#991b1b";
+      }
+    }
+
+    renderProgress({});
+
+    const events = new EventSource(`/events/${jobId}`);
+    events.addEventListener("snapshot", (event) => {
+      renderState(JSON.parse(event.data));
+    });
+    ["progress", "rpc_connected", "rpc_request", "rpc_event", "task_status", "delegated", "error", "finished"].forEach((name) => {
+      events.addEventListener(name, (event) => {
+        const payload = JSON.parse(event.data);
+        addLog(name, payload);
+        fetch(`/api/jobs/${jobId}`).then((res) => res.json()).then(renderState);
+        if (name === "finished") {
+          events.close();
+        }
+      });
+    });
+  </script>
+</body>
+</html>

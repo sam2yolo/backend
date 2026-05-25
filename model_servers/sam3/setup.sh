@@ -8,6 +8,7 @@ ENV_NAME="${SAMTOYOLO_SAM3_ENV_NAME:-samtoyolo-model-sam3}"
 PYTHON_VERSION="${SAMTOYOLO_SAM3_PYTHON:-3.12}"
 CONDA_PREFIX_ROOT="${SAMTOYOLO_CONDA_INSTALL_PREFIX:-${HOME}/.samtoyolo/miniforge3}"
 TORCH_INDEX_URL="${SAMTOYOLO_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+CONDA_CHANNEL="${SAMTOYOLO_CONDA_CHANNEL:-conda-forge}"
 
 find_conda() {
   if [[ -n "${CONDA_EXE:-}" && -x "${CONDA_EXE}" ]]; then
@@ -48,8 +49,19 @@ if ! CONDA_BIN="$(find_conda)"; then
   CONDA_BIN="$(find_conda)"
 fi
 
+if [[ "${SAMTOYOLO_CONDA_AUTO_ACCEPT_TOS:-1}" != "0" ]]; then
+  "${CONDA_BIN}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+  "${CONDA_BIN}" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
+fi
+
 if ! "${CONDA_BIN}" env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-  "${CONDA_BIN}" create -y -n "${ENV_NAME}" "python=${PYTHON_VERSION}" pip
+  "${CONDA_BIN}" create -y \
+    --override-channels \
+    -c "${CONDA_CHANNEL}" \
+    --strict-channel-priority \
+    -n "${ENV_NAME}" \
+    "python=${PYTHON_VERSION}" \
+    pip
 fi
 
 "${CONDA_BIN}" run -n "${ENV_NAME}" python -m pip install --upgrade pip

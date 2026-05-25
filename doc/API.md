@@ -756,11 +756,13 @@ Common variables:
 | `SAMTOYOLO_CONDA_BOOTSTRAP`             | `true`                       | Create/re-enter the backend conda environment on startup.                     |
 | `SAMTOYOLO_CONDA_ENV_NAME`              | `samtoyolo-backend`          | Backend runtime conda environment name.                                       |
 | `SAMTOYOLO_CONDA_PYTHON`                | `3.12`                       | Python version used when creating the env.                                    |
+| `SAMTOYOLO_CONDA_CHANNEL`               | `conda-forge`                | Conda channel used for new backend/model-server environments.                 |
+| `SAMTOYOLO_CONDA_AUTO_ACCEPT_TOS`        | `true`                       | Accepts Anaconda default-channel TOS when an existing conda install requires it. |
 | `SAMTOYOLO_CONDA_INSTALL_PREFIX`        | `~/.samtoyolo/miniforge3`    | Conda install path when conda is missing.                                     |
 | `SAMTOYOLO_TORCH_INDEX_URL`             | PyTorch CUDA 12.8 index      | Torch wheel index used by model-server setup scripts.                         |
 | `SAMTOYOLO_INSTALL_TORCH`               | `false`                      | Optional legacy backend torch install. Model servers install their own torch. |
 | `SAMTOYOLO_REQUIREMENTS_FILE`           | `requirements.txt`           | Requirements file installed into the env.                                     |
-| `TUNNELBROKER_URL`                      | unset                        | Peer registry base URL.                                                       |
+| `TUNNELBROKER_URL`                      | `https://tunnelbroker.sam2yolo.workers.dev` | Peer registry base URL.                                                       |
 | `TUNNELBROKER_GROUP`                    | unset                        | Peer registry group.                                                          |
 | `TUNNELBROKER_GROUP_TOKEN`              | unset                        | Optional group read/write token.                                              |
 | `TUNNELBROKER_PEER_SECRET`              | unset                        | Peer-owned write secret.                                                      |
@@ -787,7 +789,7 @@ Remote mode:
 
 ```bash
 SAMTOYOLO_MODE=remote \
-TUNNELBROKER_URL=https://tunnelbroker.example.workers.dev \
+TUNNELBROKER_URL=https://tunnelbroker.sam2yolo.workers.dev \
 TUNNELBROKER_GROUP=teamA \
 TUNNELBROKER_PEER_SECRET=peer-owned-secret \
 uvicorn samtoyolo_backend.main:app --host 0.0.0.0 --port 8000

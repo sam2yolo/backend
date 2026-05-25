@@ -12,7 +12,9 @@ python -m samtoyolo_backend.run
 On first run the backend checks for a conda environment named
 `samtoyolo-backend`. If it does not exist, the backend creates it, installs
 `requirements.txt`, and re-runs itself inside that environment. If conda is not
-installed, it installs Miniforge under `~/.samtoyolo/miniforge3`.
+installed, it installs Miniforge under `~/.samtoyolo/miniforge3`. Environment
+creation uses `conda-forge` by default and defensively accepts Anaconda
+default-channel TOS prompts if the host conda installation requires them.
 
 Model runtimes are isolated into separate model servers. On backend startup,
 the main server can set up and start model servers, then publish their
@@ -35,7 +37,7 @@ Cloudflare public tunnels and announces itself to Tunnelbroker.
 ```bash
 SAMTOYOLO_MODE=remote \
 SAMTOYOLO_SERVER_NAME=my-gpu-session \
-TUNNELBROKER_URL=https://your-tunnelbroker.example \
+TUNNELBROKER_URL=https://tunnelbroker.sam2yolo.workers.dev \
 TUNNELBROKER_GROUP=my-group \
 TUNNELBROKER_PEER_SECRET=peer-secret \
 TUNNELBROKER_GROUP_TOKEN=group-token \
@@ -61,4 +63,6 @@ loading FastAPI.
 The JSON-RPC WebSocket endpoint is `/v1/ws`. Large files use HTTP upload and
 download endpoints under `/v1/projects/{project_id}`.
 
-See [doc/API.md](doc/API.md) for the v1.0 API contract.
+See [doc/API.md](doc/API.md) for the v1.0 API contract and
+[doc/INFERENCE_AND_DOWNLOAD.md](doc/INFERENCE_AND_DOWNLOAD.md) for the full
+remote inference/download tutorial.

@@ -17,6 +17,11 @@ BOOTSTRAPPED_ENV_VAR = "SAMTOYOLO_CONDA_BOOTSTRAPPED"
 DEFAULT_ENV_NAME = "samtoyolo-backend"
 DEFAULT_PYTHON_VERSION = "3.12"
 DEFAULT_TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+DEFAULT_CONDA_CHANNEL = "conda-forge"
+ANACONDA_TOS_CHANNELS = (
+    "https://repo.anaconda.com/pkgs/main",
+    "https://repo.anaconda.com/pkgs/r",
+)
 MINIFORGE_URLS = {
     ("Linux", "x86_64"): (
         "https://github.com/conda-forge/miniforge/releases/latest/download/"
@@ -112,8 +117,13 @@ def _ensure_conda_env(conda: Path, env_name: str) -> Path:
         return prefix
 
     python_version = os.getenv("SAMTOYOLO_CONDA_PYTHON", DEFAULT_PYTHON_VERSION)
+    channel = os.getenv("SAMTOYOLO_CONDA_CHANNEL", DEFAULT_CONDA_CHANNEL)
+    _accept_conda_tos_if_available(conda)
     print(
-        f"[samtoyolo] creating conda env {env_name} with python={python_version}",
+        (
+            f"[samtoyolo] creating conda env {env_name} with "
+            f"python={python_version} from {channel}"
+        ),
         flush=True,
     )
     _run(
@@ -121,6 +131,10 @@ def _ensure_conda_env(conda: Path, env_name: str) -> Path:
             str(conda),
             "create",
             "-y",
+            "--override-channels",
+            "-c",
+            channel,
+            "--strict-channel-priority",
             "-n",
             env_name,
             f"python={python_version}",
@@ -198,6 +212,28 @@ def _conda_env_prefix(conda: Path, env_name: str) -> Path | None:
 
 def _run_conda_python(conda: Path, env_name: str, args: list[str]) -> None:
     _run([str(conda), "run", "-n", env_name, "python", *args])
+
+
+def _accept_conda_tos_if_available(conda: Path) -> None:
+    if not _bool_env("SAMTOYOLO_CONDA_AUTO_ACCEPT_TOS", True):
+        return
+    for channel in ANACONDA_TOS_CHANNELS:
+        result = subprocess.run(
+            [
+                str(conda),
+                "tos",
+                "accept",
+                "--override-channels",
+                "--channel",
+                channel,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"[samtoyolo] accepted conda TOS for {channel}", flush=True)
 
 
 def _env_python(env_prefix: Path) -> Path:
