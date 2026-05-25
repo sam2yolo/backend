@@ -26,12 +26,14 @@ async def handle_download_inference_result(
         raise JsonRpcError(INVALID_PARAMS, f"inference result is not ready: {task_id}")
     delete_after = bool(data.get("delete_after_download", False))
     suffix = "?delete_after_download=true" if delete_after else ""
+    relative_url = (
+        f"/v1/projects/{quote(project_id)}/downloads/inference/{quote(task_id)}{suffix}"
+    )
     return {
         "project_id": project_id,
         "task_id": task_id,
-        "download_url": (
-            f"/v1/projects/{quote(project_id)}/downloads/inference/{quote(task_id)}{suffix}"
-        ),
+        "download_url": ctx.public_url(relative_url),
+        "relative_download_url": relative_url,
         "result": result,
     }
 
@@ -47,10 +49,12 @@ async def handle_download_model(ctx: HandlerContext, params: object) -> dict[str
     model = session.get("models", {}).get(model_id)
     if not model:
         raise JsonRpcError(INVALID_PARAMS, f"unknown model_id: {model_id}")
+    relative_url = f"/v1/projects/{quote(project_id)}/downloads/models/{quote(model_id)}"
     return {
         "project_id": project_id,
         "model_id": model_id,
-        "download_url": f"/v1/projects/{quote(project_id)}/downloads/models/{quote(model_id)}",
+        "download_url": ctx.public_url(relative_url),
+        "relative_download_url": relative_url,
         "model": model,
     }
 
@@ -66,9 +70,11 @@ async def handle_download_dataset(ctx: HandlerContext, params: object) -> dict[s
     dataset = session.get("datasets", {}).get(dataset_id)
     if not dataset:
         raise JsonRpcError(INVALID_PARAMS, f"unknown dataset_id: {dataset_id}")
+    relative_url = f"/v1/projects/{quote(project_id)}/downloads/datasets/{quote(dataset_id)}"
     return {
         "project_id": project_id,
         "dataset_id": dataset_id,
-        "download_url": f"/v1/projects/{quote(project_id)}/downloads/datasets/{quote(dataset_id)}",
+        "download_url": ctx.public_url(relative_url),
+        "relative_download_url": relative_url,
         "dataset": dataset,
     }

@@ -41,13 +41,15 @@ async def lifespan(app: FastAPI):
     settings = Settings()
     connections = ConnectionManager()
     store = ProjectStore(settings.project_root)
+    tunnel_manager = TunnelManager(settings, connections)
     task_manager = TaskManager(
         store=store,
         connections=connections,
         gpu_workers=settings.resolved_gpu_workers(),
+        public_base_url_getter=lambda: settings.public_base_url
+        or tunnel_manager.state.endpoint,
     )
     register_default_executors(task_manager)
-    tunnel_manager = TunnelManager(settings, connections)
     model_server_manager = ModelServerManager(settings)
 
     app.state.settings = settings

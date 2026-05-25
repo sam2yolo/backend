@@ -260,9 +260,10 @@ Aliases: `mega_upload`, `download_mega`
 
 #### `inference_sam3(...)`
 
-Compatibility discovery method for SAM 3.1 text-prompt segmentation. The main
-backend no longer runs model inference; it ensures the SAM3 model server is set
-up and returns the model-server endpoint and RPC method to call.
+Compatibility/discovery method for SAM 3.1 text-prompt segmentation. The main
+backend prepares the SAM3 artifact, ensures the SAM3 model server is available,
+and returns the model-server endpoint and RPC method to call. Model servers own
+the CUDA runtime and the actual inference call.
 
 ```json
 {
@@ -275,6 +276,9 @@ up and returns the model-server endpoint and RPC method to call.
   },
   "sample_interval_seconds": 10,
   "batch_size": 4,
+  "output_mode": "both",
+  "include_masks": true,
+  "visualize": true,
   "save_to_mega": false,
   "prepare_model": true
 }
@@ -282,15 +286,54 @@ up and returns the model-server endpoint and RPC method to call.
 
 Aliases: `inference.sam3`
 
+Parameters:
+
+| Name | Type | Default | Description |
+| --- | --- | --- | --- |
+| `project_id` | string | required | Project workspace id. |
+| `media_path` | string | required | Project-relative image, image directory, or video path. |
+| `prompts` | string[] | `[]` | Text noun phrases passed to SAM3, such as `Road` or `Person`. |
+| `prompt_to_class` | object | `{}` | Maps each prompt to the output class name. Missing prompts map to themselves. |
+| `sample_interval_seconds` | number | `1` | Sequential video sampling interval. Ignored when random sampling is requested. |
+| `temporal_downsample` / `downsample` | number | optional | Compatibility aliases for sampling interval. Values `< 1` mean `1 / value` seconds. |
+| `sample_strategy` | string | sequential | Use `random` to sample random frames from a video. |
+| `max_frames` | integer | unset | Maximum number of video frames to extract. When set with a video, random sampling is used unless `sample_strategy` says otherwise. |
+| `random_seed` | integer | unset | Optional deterministic seed for random frame selection. |
+| `max_frame_width` | integer | unset | Optional resize width while extracting sampled video frames. Keeps aspect ratio. |
+| `batch_size` | integer | `4` | Checkpoint batch size. Values greater than `4` are capped to `4`. |
+| `output_mode` | string | `both` | `bbox`, `segmentation`, or `both`. `both` emits boxes and masks. |
+| `include_masks` | boolean | `true` | Compatibility switch. If `false`, segmentation output is disabled. |
+| `visualize` | boolean | `true` | Adds `visualizations/` images to the result zip by default. |
+| `inference_backend` | string | `video` | SAM3 backend selector. Use `video` for the video tracker or `image` for per-frame text segmentation. |
+| `sam3_backend` | string | optional | Alias for `inference_backend`. |
+| `confidence_threshold` / `output_prob_thresh` | number | `0.5` | SAM3 object confidence threshold. |
+| `sam3_max_num_objects` | integer | `16` | Video backend object slots. The SAM3.1 multiplex checkpoint expects `16`. |
+| `sam3_multiplex_count` | integer | `16` | Video backend multiplex count. |
+| `sam3_use_fa3` | boolean | `false` | Enables FA3 when supported by GPU/runtime. |
+| `sam3_compile` | boolean | `false` | Enables PyTorch compile for SAM3. |
+| `sam3_cache_model` | boolean | `true` | Keeps the loaded model in the model-server process for later requests. |
+| `sam3_allow_partial_checkpoint` | boolean | `false` | Debug-only video backend option for non-clean checkpoint loads. |
+| `prepare_model` | boolean | `true` | Downloads/extracts the SAM3 archive before inference. |
+| `model_source_url` | string | configured SAM3 URL | Override SAM3 model archive source. |
+| `model_download_url` | string | derived | Override direct archive download URL. |
+| `model_filename` | string | `sam3.1.zip` | Archive filename used for the cache. |
+| `save_to_mega` | boolean | `false` | Uploads final result to Mega when Mega support is configured. |
+
 Notes:
 
 - Returned `model_server.public_ws_url` is the public Cloudflare/Tunnelbroker
   WebSocket endpoint when remote mode is enabled; otherwise use
   `model_server.local_ws_url`.
-- Call `inference_sam3` or `sam3.infer_video_text` on that model-server
-  endpoint for real inference.
+- Call `inference_sam3` or `sam3.infer_video_text` on the model-server endpoint
+  for real inference.
 - The main backend keeps upload/project/dataset management; model servers own
   inference and training runtimes.
+- The `video` backend performs SAM3 video propagation and can emit segmentation
+  when the GPU has enough memory. The `image` backend runs SAM3 text
+  segmentation independently per sampled frame and is the practical option for
+  smaller GPUs such as T4.
+- `output_mode="bbox"` writes only `bbox`/`bbox_format`; `segmentation` writes
+  only `segmentation`/`area`; `both` writes both.
 
 Output artifact:
 
@@ -300,6 +343,144 @@ inference_results/{task_id}.zip
   annotations.json
   metadata.json
   checkpoints/
+  visualizations/        # present when visualize=true
+```
+
+`annotations.json` shape:
+
+```json
+{
+  "frames": [
+    {
+      "file_name": "000000.jpg",
+      "width": 640,
+      "height": 360,
+      "objects": [
+        {
+          "object_id": "frame0_prompt0_0",
+          "prompt": "Road",
+          "class_name": "Road",
+          "confidence": 0.91,
+          "bbox": [0.0, 180.2, 640.0, 179.8],
+          "bbox_format": "xywh_abs",
+          "segmentation": {
+            "format": "rle",
+            "encoding": "uncompressed_coco_rle",
+            "size": [360, 640],
+            "counts": [1200, 53, 11]
+          },
+          "area": 82411
+        }
+      ]
+    }
+  ]
+}
+```
+
+Clear end-to-end example for 20 random frames, max batch size 4, boxes plus
+segmentation, and default visualizations:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "sam3-demo-1",
+  "method": "inference_sam3",
+  "params": {
+    "project_id": "cctv-demo",
+    "media_path": "uploads/video/cctv.dav",
+    "prompts": ["Road", "Building", "Person", "Vehicle", "Dog"],
+    "prompt_to_class": {
+      "Road": "Road",
+      "Building": "Building",
+      "Person": "Person",
+      "Vehicle": "Vehicle",
+      "Dog": "Dog"
+    },
+    "sample_strategy": "random",
+    "max_frames": 20,
+    "random_seed": 20260525,
+    "max_frame_width": 640,
+    "batch_size": 4,
+    "inference_backend": "image",
+    "output_mode": "both",
+    "include_masks": true,
+    "visualize": true,
+    "confidence_threshold": 0.35
+  }
+}
+```
+
+The corresponding model-server call uses the returned model-server WebSocket:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "sam3-model-call-1",
+  "method": "sam3.infer_video_text",
+  "params": {
+    "frames_dir": "/workspace/projects/cctv-demo/inference_results/task_123/frames",
+    "frames": [
+      "/workspace/projects/cctv-demo/inference_results/task_123/frames/000000.jpg"
+    ],
+    "prompts": ["Road", "Building", "Person", "Vehicle", "Dog"],
+    "prompt_to_class": {
+      "Road": "Road",
+      "Building": "Building",
+      "Person": "Person",
+      "Vehicle": "Vehicle",
+      "Dog": "Dog"
+    },
+    "model_extract_dir": "/workspace/projects/_models/sam3/extracted/sam3.1",
+    "gpu_index": 0,
+    "inference_backend": "image",
+    "output_mode": "both",
+    "include_masks": true,
+    "output_prob_thresh": 0.35,
+    "cache_model": true
+  }
+}
+```
+
+During model-server inference, progress is sent as JSON-RPC notifications:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "model.progress",
+  "params": {
+    "progress": 42.5,
+    "message": "SAM image prompt 4/5 frame 9/20",
+    "metrics": {
+      "gpu_index": 0,
+      "prompt": "Vehicle",
+      "frame_index": 8
+    }
+  }
+}
+```
+
+After the backend emits `inference_result_ready`, download the zip with:
+
+```bash
+curl -OJ \
+  "http://localhost:8000/v1/projects/cctv-demo/downloads/inference/task_123"
+```
+
+Clients can summarize `annotations.json` after download. For example, a
+20-frame run might produce:
+
+```json
+{
+  "total_objects": 354,
+  "objects_by_class": {
+    "Building": 152,
+    "Person": 62,
+    "Road": 89,
+    "Vehicle": 51
+  },
+  "bbox_count": 354,
+  "segmentation_count": 354
+}
 ```
 
 #### `inference_yolo(project_id, media_path, batch_size?, sample_interval_seconds?)`
@@ -489,6 +670,7 @@ Alias: `tunnel.restart`
 | `task_failed` | `{ "task_id": "...", "error": "..." }` |
 | `task_cancelled` | `{ "task_id": "..." }` |
 | `inference_result_ready` | `{ "task_id": "...", "file_path_or_url": "/v1/..." }` |
+| `model.progress` | `{ "progress": 0-100, "message": "...", "metrics": {} }` from a model-server WebSocket. |
 | `training_complete` | `{ "task_id": "...", "model_id": "...", "metrics": {} }` |
 | `new_dataset_from_merge` | `{ "task_id": "...", "dataset_id": "..." }` |
 | `new_dataset_from_map` | `{ "task_id": "...", "dataset_id": "..." }` |
@@ -554,35 +736,35 @@ curl -OJ \
 
 Common variables:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `SAMTOYOLO_PROJECT_ROOT` | `projects` | Project/session storage root. |
-| `SAMTOYOLO_MODE` | `local` | `local` or `remote`. |
-| `SAMTOYOLO_HOST` | `0.0.0.0` | Uvicorn host. |
-| `SAMTOYOLO_PORT` | `8000` | Uvicorn port. |
-| `SAMTOYOLO_GPU_WORKERS` | auto | Number of GPU worker coroutines. |
-| `SAMTOYOLO_INSTANCE_TTL_SECONDS` | `42600` | 11h50m cloud-session timer. |
-| `SAMTOYOLO_EXPIRY_NOTICE_SECONDS` | `900` | When to emit `session_expiring`. |
-| `SAMTOYOLO_ALLOW_STUB_ML` | `true` | Allows stub inference/training artifacts before real adapters are installed. |
-| `SAMTOYOLO_SAM3_MODEL_URL` | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source. |
-| `SAMTOYOLO_SAM3_MODEL_FILENAME` | `sam3.1.zip` | Expected SAM 3.1 archive filename. |
-| `SAMTOYOLO_SAM3_SERVER_URL` | `ws://127.0.0.1:8101/v1/ws` | SAM 3.1 model server WebSocket endpoint. |
-| `SAMTOYOLO_MODEL_SERVERS_AUTO_START` | `true` | Set up and start model servers on backend startup. |
-| `SAMTOYOLO_MODEL_SERVERS_PUBLIC_TUNNEL` | `false` | Create public tunnels for model servers even outside remote mode. |
-| `SAMTOYOLO_SAM3_SERVER_PORT` | `8101` | Local SAM3 model server port. |
-| `SAMTOYOLO_MODEL_CACHE_DIR` | `{project_root}/_models` | Shared model artifact cache directory. |
-| `SAMTOYOLO_CONDA_BOOTSTRAP` | `true` | Create/re-enter the backend conda environment on startup. |
-| `SAMTOYOLO_CONDA_ENV_NAME` | `samtoyolo-backend` | Backend runtime conda environment name. |
-| `SAMTOYOLO_CONDA_PYTHON` | `3.12` | Python version used when creating the env. |
-| `SAMTOYOLO_CONDA_INSTALL_PREFIX` | `~/.samtoyolo/miniforge3` | Conda install path when conda is missing. |
-| `SAMTOYOLO_TORCH_INDEX_URL` | PyTorch CUDA 12.8 index | Torch wheel index used by model-server setup scripts. |
-| `SAMTOYOLO_INSTALL_TORCH` | `false` | Optional legacy backend torch install. Model servers install their own torch. |
-| `SAMTOYOLO_REQUIREMENTS_FILE` | `requirements.txt` | Requirements file installed into the env. |
-| `TUNNELBROKER_URL` | unset | Peer registry base URL. |
-| `TUNNELBROKER_GROUP` | unset | Peer registry group. |
-| `TUNNELBROKER_GROUP_TOKEN` | unset | Optional group read/write token. |
-| `TUNNELBROKER_PEER_SECRET` | unset | Peer-owned write secret. |
-| `CLOUDFLARED_PATH` | `cloudflared` | Cloudflared executable. |
+| Variable                                | Default                      | Purpose                                                                       |
+| --------------------------------------- | ---------------------------- | ----------------------------------------------------------------------------- |
+| `SAMTOYOLO_PROJECT_ROOT`                | `projects`                   | Project/session storage root.                                                 |
+| `SAMTOYOLO_MODE`                        | `local`                      | `local` or `remote`.                                                          |
+| `SAMTOYOLO_HOST`                        | `0.0.0.0`                    | Uvicorn host.                                                                 |
+| `SAMTOYOLO_PORT`                        | `8000`                       | Uvicorn port.                                                                 |
+| `SAMTOYOLO_GPU_WORKERS`                 | auto                         | Number of GPU worker coroutines.                                              |
+| `SAMTOYOLO_INSTANCE_TTL_SECONDS`        | `42600`                      | 11h50m cloud-session timer.                                                   |
+| `SAMTOYOLO_EXPIRY_NOTICE_SECONDS`       | `900`                        | When to emit `session_expiring`.                                              |
+| `SAMTOYOLO_ALLOW_STUB_ML`               | `true`                       | Allows stub inference/training artifacts before real adapters are installed.  |
+| `SAMTOYOLO_SAM3_MODEL_URL`              | Google Drive SAM 3.1 archive | Default SAM 3.1 model artifact source.                                        |
+| `SAMTOYOLO_SAM3_MODEL_FILENAME`         | `sam3.1.zip`                 | Expected SAM 3.1 archive filename.                                            |
+| `SAMTOYOLO_SAM3_SERVER_URL`             | `ws://127.0.0.1:8101/v1/ws`  | SAM 3.1 model server WebSocket endpoint.                                      |
+| `SAMTOYOLO_MODEL_SERVERS_AUTO_START`    | `true`                       | Set up and start model servers on backend startup.                            |
+| `SAMTOYOLO_MODEL_SERVERS_PUBLIC_TUNNEL` | `false`                      | Create public tunnels for model servers even outside remote mode.             |
+| `SAMTOYOLO_SAM3_SERVER_PORT`            | `8101`                       | Local SAM3 model server port.                                                 |
+| `SAMTOYOLO_MODEL_CACHE_DIR`             | `{project_root}/_models`     | Shared model artifact cache directory.                                        |
+| `SAMTOYOLO_CONDA_BOOTSTRAP`             | `true`                       | Create/re-enter the backend conda environment on startup.                     |
+| `SAMTOYOLO_CONDA_ENV_NAME`              | `samtoyolo-backend`          | Backend runtime conda environment name.                                       |
+| `SAMTOYOLO_CONDA_PYTHON`                | `3.12`                       | Python version used when creating the env.                                    |
+| `SAMTOYOLO_CONDA_INSTALL_PREFIX`        | `~/.samtoyolo/miniforge3`    | Conda install path when conda is missing.                                     |
+| `SAMTOYOLO_TORCH_INDEX_URL`             | PyTorch CUDA 12.8 index      | Torch wheel index used by model-server setup scripts.                         |
+| `SAMTOYOLO_INSTALL_TORCH`               | `false`                      | Optional legacy backend torch install. Model servers install their own torch. |
+| `SAMTOYOLO_REQUIREMENTS_FILE`           | `requirements.txt`           | Requirements file installed into the env.                                     |
+| `TUNNELBROKER_URL`                      | unset                        | Peer registry base URL.                                                       |
+| `TUNNELBROKER_GROUP`                    | unset                        | Peer registry group.                                                          |
+| `TUNNELBROKER_GROUP_TOKEN`              | unset                        | Optional group read/write token.                                              |
+| `TUNNELBROKER_PEER_SECRET`              | unset                        | Peer-owned write secret.                                                      |
+| `CLOUDFLARED_PATH`                      | `cloudflared`                | Cloudflared executable.                                                       |
 
 Run locally:
 
@@ -636,6 +818,21 @@ SAM 3.1 ships with:
 - public endpoint: stored in Tunnelbroker metadata as `ws_endpoint`
 - inference RPC methods: `inference_sam3`, `sam3.infer_video_text`
 - training RPC method: `train_model` (currently reports not implemented for SAM3)
+
+SAM3 model-server inference backends:
+
+| Backend | Selector | Output | When to use |
+| --- | --- | --- | --- |
+| Video tracker | `"video"` | Video propagation, boxes, optional RLE masks | Larger GPUs where SAM3 video propagation fits in memory. |
+| Image processor | `"image"` | Per-frame text segmentation, boxes, RLE masks | Smaller GPUs or random-frame dataset generation. |
+
+SAM3 output modes:
+
+| `output_mode` | Object fields |
+| --- | --- |
+| `bbox` | `bbox`, `bbox_format` |
+| `segmentation` | `segmentation`, `area` |
+| `both` | `bbox`, `bbox_format`, `segmentation`, `area` |
 
 Main-backend model server management RPCs:
 

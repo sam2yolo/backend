@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import events
+from .cloudflared import ensure_cloudflared_path
 from .config import Settings
 from .connections import ConnectionManager
 
@@ -79,8 +80,11 @@ class TunnelManager:
 
         self.state.cloudflared_running = False
         self.state.endpoint = None
+        cloudflared_path = await asyncio.to_thread(
+            ensure_cloudflared_path, self.settings.cloudflared_path
+        )
         self._process = await asyncio.create_subprocess_exec(
-            self.settings.cloudflared_path,
+            cloudflared_path,
             "tunnel",
             "--url",
             self.settings.http_bind_url,

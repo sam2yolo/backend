@@ -8,6 +8,7 @@ from typing import Any
 from . import events
 from .connections import ConnectionManager
 from .records import TaskRecord, TaskStatus, utc_now
+from .public_urls import join_public_url
 from .storage import ProjectStore
 
 
@@ -17,6 +18,13 @@ class TaskContext:
     store: ProjectStore
     connections: ConnectionManager
     task: TaskRecord
+
+    @property
+    def public_base_url(self) -> str | None:
+        return self.manager.public_base_url()
+
+    def public_url(self, path: str) -> str:
+        return join_public_url(self.public_base_url, path)
 
     async def progress(
         self,
@@ -35,6 +43,7 @@ class TaskContext:
 
 
 TaskExecutor = Callable[[TaskContext], Awaitable[dict[str, Any]]]
+PublicBaseUrlGetter = Callable[[], str | None]
 
 
 class TaskManager:
@@ -44,10 +53,12 @@ class TaskManager:
         store: ProjectStore,
         connections: ConnectionManager,
         gpu_workers: int,
+        public_base_url_getter: PublicBaseUrlGetter | None = None,
     ) -> None:
         self.store = store
         self.connections = connections
         self.gpu_workers = max(1, gpu_workers)
+        self._public_base_url_getter = public_base_url_getter or (lambda: None)
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task[None]] = []
         self._executors: dict[str, TaskExecutor] = {}
@@ -55,6 +66,9 @@ class TaskManager:
 
     def register_executor(self, task_type: str, executor: TaskExecutor) -> None:
         self._executors[task_type] = executor
+
+    def public_base_url(self) -> str | None:
+        return self._public_base_url_getter()
 
     async def start(self) -> None:
         if self._started:

@@ -231,14 +231,17 @@ async def _execute_inference(ctx: TaskContext, *, model_name: str) -> dict[str, 
     await asyncio.to_thread(zip_directory, result_dir, zip_path)
 
     rel_zip = ctx.store.relative_to_project(ctx.task.project_id, zip_path)
+    relative_download_url = (
+        f"/v1/projects/{quote(ctx.task.project_id)}/downloads/inference/"
+        f"{quote(ctx.task.task_id)}"
+    )
+    download_url = ctx.public_url(relative_download_url)
     result_payload = {
         "task_id": ctx.task.task_id,
         "format": "samtoyolo.inference.zip",
         "zip_path": rel_zip,
-        "download_url": (
-            f"/v1/projects/{quote(ctx.task.project_id)}/downloads/inference/"
-            f"{quote(ctx.task.task_id)}"
-        ),
+        "download_url": download_url,
+        "relative_download_url": relative_download_url,
         "model_source_url": params.get("model_source_url"),
         "model_asset": model_asset.to_dict() if model_asset else None,
         "created_at": utc_now(),

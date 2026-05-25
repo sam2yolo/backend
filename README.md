@@ -26,6 +26,29 @@ model_servers/sam3/run.sh
 Clients should call inference and training methods on the model-server
 WebSocket endpoint returned by `models()` or `get_model_server_list()`.
 
+## Remote Notebook Startup
+
+In production notebook environments, the client should not need SSH access. The
+notebook only starts the backend with remote settings; the backend then creates
+Cloudflare public tunnels and announces itself to Tunnelbroker.
+
+```bash
+SAMTOYOLO_MODE=remote \
+SAMTOYOLO_SERVER_NAME=my-gpu-session \
+TUNNELBROKER_URL=https://your-tunnelbroker.example \
+TUNNELBROKER_GROUP=my-group \
+TUNNELBROKER_PEER_SECRET=peer-secret \
+TUNNELBROKER_GROUP_TOKEN=group-token \
+python -m samtoyolo_backend.run
+```
+
+If `cloudflared` is not installed, the backend downloads a Linux binary into
+`~/.samtoyolo/bin` before opening the tunnel. The main backend registers as
+`SAMTOYOLO_SERVER_NAME`; the SAM3 model server registers as
+`SAMTOYOLO_SERVER_NAME-sam3` with its public WebSocket endpoint in metadata.
+The client discovers these peers from Tunnelbroker and then uses public WSS/HTTP
+URLs for RPC, uploads, inference, and result downloads.
+
 You can still call uvicorn directly:
 
 ```bash

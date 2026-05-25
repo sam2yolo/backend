@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .cloudflared import ensure_cloudflared_path
 from .config import Settings
 
 
@@ -85,14 +86,27 @@ class ModelServerManager:
         }
         self._server_processes: dict[str, asyncio.subprocess.Process] = {}
         self._tunnel_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._tunnel_heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stop = asyncio.Event()
 
     async def start(self) -> None:
         if not self.settings.model_servers_auto_start:
             return
+        self._stop.clear()
         for name in self._specs:
             await self.ensure_running(name)
+            if self.settings.is_remote or self.settings.model_servers_public_tunnel:
+                self._start_tunnel_heartbeat(name)
 
     async def stop(self) -> None:
+        self._stop.set()
+        for task in self._tunnel_heartbeat_tasks.values():
+            task.cancel()
+        if self._tunnel_heartbeat_tasks:
+            await asyncio.gather(
+                *self._tunnel_heartbeat_tasks.values(), return_exceptions=True
+            )
+        self._tunnel_heartbeat_tasks.clear()
         for process in [*self._tunnel_processes.values(), *self._server_processes.values()]:
             if process.returncode is None:
                 process.terminate()
@@ -109,7 +123,9 @@ class ModelServerManager:
             if self.settings.is_remote or self.settings.model_servers_public_tunnel:
                 await self._start_tunnel(spec, state)
                 await self._register_tunnel(spec, state)
-            state.last_error = None
+                self._start_tunnel_heartbeat(name)
+            if not state.last_error:
+                state.last_error = None
         except Exception as exc:
             state.last_error = str(exc)
             raise
@@ -128,6 +144,26 @@ class ModelServerManager:
         state.public_ws_url = None
         state.tunnel_registered = False
         return await self.ensure_running(name)
+
+    def _start_tunnel_heartbeat(self, name: str) -> None:
+        task = self._tunnel_heartbeat_tasks.get(name)
+        if task and not task.done():
+            return
+        self._tunnel_heartbeat_tasks[name] = asyncio.create_task(
+            self._run_tunnel_heartbeat(name)
+        )
+
+    async def _run_tunnel_heartbeat(self, name: str) -> None:
+        spec = self._require_spec(name)
+        state = self._states[name]
+        while not self._stop.is_set():
+            try:
+                await self._start_server(spec, state)
+                await self._start_tunnel(spec, state)
+                await self._register_tunnel(spec, state)
+            except Exception as exc:
+                state.last_error = str(exc)
+            await asyncio.sleep(self.settings.tunnel_heartbeat_seconds)
 
     def status(self, name: str | None = None) -> dict[str, Any]:
         if name:
@@ -193,8 +229,11 @@ class ModelServerManager:
         if process and process.returncode is None and state.public_http_url:
             state.tunnel_running = True
             return
+        cloudflared_path = await asyncio.to_thread(
+            ensure_cloudflared_path, self.settings.cloudflared_path
+        )
         process = await asyncio.create_subprocess_exec(
-            self.settings.cloudflared_path,
+            cloudflared_path,
             "tunnel",
             "--url",
             spec.local_http_url,
@@ -220,6 +259,7 @@ class ModelServerManager:
             and self.settings.peer_secret
         ):
             state.last_error = "tunnelbroker settings are incomplete"
+            state.tunnel_registered = False
             return
 
         try:
@@ -251,6 +291,7 @@ class ModelServerManager:
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
         state.tunnel_registered = True
+        state.last_error = None
 
     async def _health(self, base_url: str) -> bool:
         try:

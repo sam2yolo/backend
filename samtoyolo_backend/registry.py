@@ -6,6 +6,8 @@ from typing import Any
 
 from fastapi import WebSocket
 
+from .public_urls import join_public_url
+
 
 HandlerResult = dict[str, Any] | list[Any] | str | int | float | bool | None
 JsonRpcHandler = Callable[["HandlerContext", Any], Awaitable[HandlerResult]]
@@ -32,6 +34,16 @@ class HandlerContext:
     @property
     def connections(self) -> Any:
         return self.app.state.connections
+
+    @property
+    def public_base_url(self) -> str | None:
+        settings_url = getattr(self.settings, "public_base_url", None)
+        tunnel_manager = getattr(self.app.state, "tunnel_manager", None)
+        tunnel_url = getattr(getattr(tunnel_manager, "state", None), "endpoint", None)
+        return settings_url or tunnel_url
+
+    def public_url(self, path: str) -> str:
+        return join_public_url(self.public_base_url, path)
 
 
 class MethodRegistry:
