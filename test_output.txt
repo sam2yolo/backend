@@ -1,0 +1,49 @@
+============================================================
+🔌 TEST: Google Drive download with disconnect/reconnect
+============================================================
+
+[1] Connecting to WebSocket...
+✅ Connected (ws1)
+
+[2] Sending download_file_google_drive action...
+✅ Download action sent
+[3] Waiting for download to start (receiving messages for 5 seconds)...
+   ⏱️  No message received in 1s...
+   ⏱️  No message received in 2s...
+   📥 Download initiated: file_id=bd05b889-4a9a-41, path=/home/hamim-mahmud/Workspace/twowayrpc/A01_20260501080516.mp4
+   📊 Progress: 0% - ETA: N/A - Size: 16.3M
+   📊 Progress: 3% - ETA: N/A - Size: 16.3M
+   📊 Progress: 13% - ETA: N/A - Size: 16.3M
+   📊 Progress: 19% - ETA: N/A - Size: 16.3M
+   📊 Progress: 26% - ETA: N/A - Size: 16.3M
+   📊 Progress: 39% - ETA: N/A - Size: 16.3M
+   📊 Progress: 45% - ETA: N/A - Size: 16.3M
+
+[4] 💥 Disconnecting client (closing WebSocket)...
+✅ Disconnected
+[5] Waiting 3 seconds while download continues in background...
+
+[6] Reconnecting...
+✅ Reconnected (ws2)
+[7] Checking for flushed pending messages (receiving for 15 seconds)...
+   📊 Flushed progress: 51% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 58% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 64% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 71% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 74% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 77% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 80% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 83% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 87% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 90% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 93% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 96% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 99% - file_id=bd05b889-4a9a-41
+   📊 Flushed progress: 100% - file_id=bd05b889-4a9a-41
+   ✅ Flushed download completed: file_id=bd05b889-4a9a-41, path=files/bd05b889-4a9a-41
+
+============================================================
+✅ PASS: 15 pending message(s) flushed after reconnect!
+   🎯 Download completed! file_id=bd05b889-4a9a-41, path=files/bd05b889-4a9a-41
+============================================================
+✅ Test connection closed

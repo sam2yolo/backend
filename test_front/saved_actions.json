@@ -1,0 +1,31 @@
+[
+  {
+    "id": "1",
+    "action": "init_model",
+    "payload": {
+      "model_name": "yolo"
+    },
+    "label": "Init Model Yolo"
+  },
+  {
+    "id": "2",
+    "action": "download_file_google_drive",
+    "payload": {
+      "url": "https://drive.google.com/file/d/1TtqAIblLhsAk7vOcVpBTrR3w2EDrZRcL/view?usp=drive_link"
+    },
+    "label": "Download File"
+  },
+  {
+    "id": "3",
+    "action": "create_inference_task",
+    "payload": {
+      "model_name": "yolo",
+      "file_id": "0de01694-d4df-40",
+      "file_type": "video",
+      "batch": 128,
+      "conf": 0.25,
+      "iou": 0.45
+    },
+    "label": "Create Inference Task Yolo"
+  }
+]

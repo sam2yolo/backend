@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TwoWayRPC — Postman for WebSocket</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        * { scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+        .fade-in { animation: fadeIn .15s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
+        .json-str { color: #86efac; }
+        .json-num { color: #fda4af; }
+        .json-bool { color: #c4b5fd; }
+        .json-null { color: #9ca3af; }
+        .json-key { color: #22d3ee; }
+        .json-br { color: #d1d5db; }
+        .tree-toggle { cursor: pointer; user-select: none; }
+        .tree-toggle:hover { color: #22d3ee; }
+        .msg-sent { border-left: 3px solid #06b6d4; }
+        .msg-recv { border-left: 3px solid #34d399; }
+        .msg-error { border-left: 3px solid #f87171; }
+        .msg-sys { border-left: 3px solid #a78bfa; }
+        .field-row:hover { background: rgba(255,255,255,0.03); }
+        .field-row input:focus, .field-row select:focus { outline: none; border-color: #06b6d4; }
+        #response-panel { scroll-behavior: smooth; }
+        #history-panel { scroll-behavior: smooth; }
+        .sub-fields, .sub-items { border-left: 1px solid #374151; padding-left: 8px; margin-left: 4px; }
+        .nested-badge { font-size: 9px; color: #6b7280; background: #1f2937; border-radius: 3px; padding: 0 5px; line-height: 18px; white-space: nowrap; }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 font-mono text-xs h-screen flex flex-col overflow-hidden">
+
+    <!-- ===================== TOP CONNECTION BAR ===================== -->
+    <header class="flex items-center gap-3 px-4 py-2 border-b border-gray-700 bg-gray-900/80 shrink-0">
+        <div class="flex items-center gap-2 shrink-0">
+            <span class="text-cyan-400 font-bold text-lg">◈</span>
+            <h1 class="text-sm font-bold text-cyan-400 whitespace-nowrap">TwoWayRPC</h1>
+        </div>
+        <span id="conn-dot" class="w-2 h-2 rounded-full bg-red-500 shrink-0"></span>
+        <span id="conn-txt" class="text-[11px] text-red-400 shrink-0">Disconnected</span>
+        <input id="ws-url" type="text" value="ws://localhost:8000/ws"
+            class="flex-1 min-w-[200px] bg-gray-800 border border-gray-600 rounded px-2 py-1 text-[11px] focus:outline-none focus:border-cyan-500 font-mono">
+        <button id="conn-btn" onclick="toggleConnect()"
+            class="bg-cyan-600 hover:bg-cyan-500 px-4 py-1 rounded text-[11px] font-semibold transition shrink-0">Connect</button>
+        <div class="flex-1"></div>
+        <button onclick="clearAll()"
+            class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-[11px] transition shrink-0">Clear All</button>
+    </header>
+
+    <!-- ===================== MAIN LAYOUT ===================== -->
+    <div class="flex flex-1 overflow-hidden">
+
+        <!-- ===== LEFT SIDEBAR ===== -->
+        <aside class="w-60 bg-gray-900/60 border-r border-gray-800 flex flex-col shrink-0 overflow-hidden">
+
+            <!-- Collections -->
+            <div class="p-2 border-b border-gray-800">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="text-[10px] font-semibold text-cyan-500 uppercase tracking-wider">Collections</span>
+                    <span class="text-[9px] text-gray-600">templates</span>
+                </div>
+                <div class="space-y-1 max-h-[280px] overflow-y-auto" id="collection-list">
+                    <div>
+                        <div onclick="toggleGroup(this)" class="flex items-center gap-1 text-[10px] text-gray-500 font-semibold uppercase tracking-wider px-1 cursor-pointer hover:text-cyan-400">
+                            <span class="arrow text-gray-600">▶</span> General
+                        </div>
+                        <div class="group-content pl-3 space-y-0.5">
+                            <button onclick="tmpl('ping',{})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-blue-400 mr-1">♢</span>Ping</button>
+                            <button onclick="tmpl('list_models',{})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-blue-400 mr-1">♢</span>List Models</button>
+                            <button onclick="tmpl('list_files',{})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-blue-400 mr-1">♢</span>List Files</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div onclick="toggleGroup(this)" class="flex items-center gap-1 text-[10px] text-gray-500 font-semibold uppercase tracking-wider px-1 cursor-pointer hover:text-cyan-400">
+                            <span class="arrow text-gray-600">▶</span> Model
+                        </div>
+                        <div class="group-content pl-3 space-y-0.5">
+                            <button onclick="tmpl('init_model',{model_name:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-emerald-400 mr-1">◆</span>Init Model</button>
+                            <button onclick="tmpl('destroy_model',{model_name:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-red-400 mr-1">◆</span>Destroy Model</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div onclick="toggleGroup(this)" class="flex items-center gap-1 text-[10px] text-gray-500 font-semibold uppercase tracking-wider px-1 cursor-pointer hover:text-cyan-400">
+                            <span class="arrow text-gray-600">▶</span> Files
+                        </div>
+                        <div class="group-content pl-3 space-y-0.5">
+                            <button onclick="tmpl('download_file_wget',{url:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-amber-400 mr-1">⬇</span>Download (wget)</button>
+                            <button onclick="tmpl('download_file_google_drive',{url:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-amber-400 mr-1">⬇</span>Download (gdrive)</button>
+                            <button onclick="tmpl('delete_file',{file_id:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-red-400 mr-1">✕</span>Delete File</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div onclick="toggleGroup(this)" class="flex items-center gap-1 text-[10px] text-gray-500 font-semibold uppercase tracking-wider px-1 cursor-pointer hover:text-cyan-400">
+                            <span class="arrow text-gray-600">▶</span> Inference
+                        </div>
+                        <div class="group-content pl-3 space-y-0.5">
+                            <button onclick="tmpl('create_inference_task',{model_name:'',file_id:'',file_type:'image',batch_size:4,conf:0.25,iou:0.45})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Create Task</button>
+                            <button onclick="tmpl('delete_inference_task',{task_id:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Delete Task</button>
+                            <button onclick="tmpl('start_inference_from_queue',{})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Start Queue</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Saved Actions -->
+            <div class="p-2 border-b border-gray-800">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="text-[10px] font-semibold text-cyan-500 uppercase tracking-wider">Saved Actions</span>
+                    <span class="text-[9px] text-gray-600">persistent</span>
+                </div>
+                <div id="saved-actions-list" class="space-y-0.5 max-h-[200px] overflow-y-auto">
+                    <div class="text-gray-700 italic text-[10px] text-center py-2">No saved actions yet.</div>
+                </div>
+            </div>
+
+            <!-- Server Files -->
+            <div class="p-2 border-b border-gray-800">
+                <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">Server Files</div>
+                <div id="files-panel" class="text-[10px] text-gray-600 max-h-24 overflow-y-auto">Connect to see files.</div>
+            </div>
+
+            <!-- History -->
+            <div class="flex-1 p-2 overflow-hidden flex flex-col min-h-0">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">History</span>
+                    <span id="msg-count" class="text-[9px] text-gray-600">0</span>
+                </div>
+                <div id="history-panel" class="flex-1 overflow-y-auto space-y-0.5 text-[10px]">
+                    <div class="text-gray-700 italic text-center mt-8">No messages yet.</div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ===== CENTER ===== -->
+        <div class="flex-1 flex flex-col overflow-hidden min-w-0">
+
+            <!-- Request Builder -->
+            <div class="border-b border-gray-800 bg-gray-900/30 p-3 shrink-0">
+                <div class="flex items-center gap-2 mb-3">
+                    <span class="text-[11px] font-semibold text-cyan-400 uppercase tracking-wider">Request</span>
+                    <span class="text-gray-600 text-[10px]">WebSocket message builder</span>
+                </div>
+                <div class="flex flex-wrap items-start gap-3">
+                    <div class="flex flex-col gap-1 w-44">
+                        <label class="text-[9px] text-gray-500 uppercase tracking-wider">Action</label>
+                        <input id="req-action" type="text" placeholder="action name" list="action-suggestions"
+                            class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-[11px] focus:outline-none focus:border-cyan-500">
+                        <datalist id="action-suggestions">
+                            <option value="ping"><option value="pong"><option value="list_models">
+                            <option value="init_model"><option value="destroy_model"><option value="list_files">
+                            <option value="delete_file"><option value="download_file_wget">
+                            <option value="download_file_google_drive"><option value="create_inference_task">
+                            <option value="delete_inference_task"><option value="start_inference_from_queue">
+                        </datalist>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-[9px] text-gray-500 uppercase tracking-wider">&nbsp;</label>
+                        <button onclick="sendStructured()"
+                            class="bg-cyan-600 hover:bg-cyan-500 px-5 py-1.5 rounded text-xs font-semibold transition flex items-center gap-1.5 h-[30px]">
+                            <span class="text-sm">⟶</span> Send
+                        </button>
+                    </div>
+                    <div class="flex flex-col gap-1">
+                        <label class="text-[9px] text-gray-500 uppercase tracking-wider">&nbsp;</label>
+                        <button onclick="saveCurrentAction()"
+                            class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded text-xs font-semibold transition flex items-center gap-1.5 h-[30px]">
+                            <span class="text-sm">+</span> Save
+                        </button>
+                    </div>
+                    <div class="flex items-center gap-2 ml-auto">
+                        <button id="tab-structured" onclick="switchTab('structured')" class="text-[10px] text-cyan-400 border-b-2 border-cyan-400 pb-0.5 transition">Fields</button>
+                        <button id="tab-raw" onclick="switchTab('raw')" class="text-[10px] text-gray-500 hover:text-cyan-400 pb-0.5 transition">Raw JSON</button>
+                    </div>
+                </div>
+                <div id="editor-structured" class="mt-2">
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="text-[9px] text-gray-500 uppercase tracking-wider">Payload Fields</span>
+                        <button onclick="addField()" class="text-gray-400 hover:text-cyan-400 text-[10px] px-1.5 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition">+ Add</button>
+                        <button onclick="clearFields()" class="text-gray-500 hover:text-red-400 text-[10px] px-1.5 py-0.5 rounded hover:bg-gray-800 transition">Clear</button>
+                    </div>
+                    <div id="payload-fields" class="space-y-1 max-h-72 overflow-y-auto">
+                        <div class="text-gray-600 text-[10px] italic">Select a template or add fields.</div>
+                    </div>
+                </div>
+                <div id="editor-raw" class="hidden mt-2">
+                    <textarea id="raw-json" rows="3"
+                        class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:border-cyan-500"
+                        placeholder='{"action":"ping","payload":{}}'></textarea>
+                    <div class="flex gap-1.5 mt-1">
+                        <button onclick="parseRaw()" class="text-gray-400 hover:text-cyan-400 text-[10px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition">← Parse to Fields</button>
+                        <button onclick="syncRaw()" class="text-gray-400 hover:text-cyan-400 text-[10px] px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition">Sync to Raw</button>
+                        <button onclick="sendRaw()" class="bg-purple-600 hover:bg-purple-500 px-3 py-0.5 rounded text-[10px] transition">Send Raw</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Response Viewer -->
+            <div class="flex-1 flex flex-col overflow-hidden min-h-0">
+                <div class="flex items-center justify-between px-3 py-1.5 border-b border-gray-800 bg-gray-900/20 shrink-0">
+                    <div class="flex items-center gap-3">
+                        <span class="text-[11px] font-semibold text-cyan-400 uppercase tracking-wider">Response</span>
+                        <button onclick="switchRespView('structured')" id="rview-structured" class="text-cyan-400 border-b-2 border-cyan-400 pb-0.5 text-[10px] transition">Structured</button>
+                        <button onclick="switchRespView('raw')" id="rview-raw" class="pb-0.5 text-gray-500 hover:text-cyan-400 text-[10px] transition">Raw Log</button>
+                    </div>
+                    <span id="resp-count" class="text-[10px] text-gray-600">0 messages</span>
+                </div>
+                <div id="response-panel" class="flex-1 overflow-y-auto p-3 space-y-2">
+                    <div class="text-gray-700 text-[11px] text-center mt-16 italic">Build a message and click <span class="text-cyan-500">Send</span>.</div>
+                </div>
+                <div id="raw-log-panel" class="hidden flex-1 overflow-y-auto p-3 space-y-1">
+                    <div class="text-gray-700 text-[11px] text-center mt-16 italic">Switch to Raw Log to see all raw messages.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ================================================================
+        //  STATE
+        // ================================================================
+        let ws = null;
+        let connected = false;
+        let fieldIdx = 0;
+        let msgCount = 0;
+        const CONN_DOT = document.getElementById('conn-dot');
+        const CONN_TXT = document.getElementById('conn-txt');
+        const CONN_BTN = document.getElementById('conn-btn');
+        const HIST = document.getElementById('history-panel');
+        const RESP = document.getElementById('response-panel');
+        const RAW_LOG = document.getElementById('raw-log-panel');
+        const RAW_JSON = document.getElementById('raw-json');
+        const REQ_ACT = document.getElementById('req-action');
+        const FIELDS = document.getElementById('payload-fields');
+        const MSG_CNT = document.getElementById('msg-count');
+        const RESP_CNT = document.getElementById('resp-count');
+        let currentTab = 'structured';
+        let currentView = 'structured';
+
+        // ================================================================
+        //  SAVED ACTIONS (persistent via backend API)
+        // ================================================================
+        async function loadSavedActions() {
+            try {
+                const r = await fetch('/api/actions');
+                const actions = await r.json();
+                renderSavedActions(actions);
+            } catch { /* server not ready yet */ }
+        }
+
+        function renderSavedActions(actions) {
+            const container = document.getElementById('saved-actions-list');
+            if (!actions || actions.length === 0) {
+                container.innerHTML = '<div class="text-gray-700 italic text-[10px] text-center py-2">No saved actions yet.</div>';
+                return;
+            }
+            container.innerHTML = actions.map(a => `
+                <div class="saved-action-item flex items-center gap-1 px-1 py-0.5 rounded hover:bg-gray-800 group" data-id="${esc(a.id)}">
+                    <span class="text-emerald-400 mr-1 text-[10px]">◈</span>
+                    <button onclick="loadAction('${esc(a.id)}')" class="flex-1 text-left truncate text-gray-300 hover:text-cyan-400 text-[11px]" title="${esc(a.label)} (${esc(a.action)})">${esc(a.label)}</button>
+                    <button onclick="deleteAction('${esc(a.id)}')" class="text-gray-600 hover:text-red-400 text-[9px] opacity-0 group-hover:opacity-100 transition px-1" title="Delete">✕</button>
+                </div>
+            `).join('');
+        }
+
+        async function saveCurrentAction() {
+            const action = document.getElementById('req-action').value.trim();
+            if (!action) { logMsg('error', 'Action name is required to save', null, null); return; }
+            const payload = getPayload();
+
+            // Show the save dialog
+            document.getElementById('save-dialog-label').value = action;
+            document.getElementById('save-dialog').classList.remove('hidden');
+            document.getElementById('save-dialog-label').focus();
+            document.getElementById('save-dialog-label').select();
+        }
+
+        async function confirmSave() {
+            const action = document.getElementById('req-action').value.trim();
+            const payload = getPayload();
+            const label = document.getElementById('save-dialog-label').value.trim();
+            if (!label) return;
+
+            document.getElementById('save-dialog').classList.add('hidden');
+
+            try {
+                const r = await fetch('/api/actions', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({action, payload, label})
+                });
+                if (!r.ok) { const e = await r.json(); logMsg('error', 'Save failed: ' + (e.error||'unknown'), null, null); return; }
+                logSys(`Saved action: ${label}`);
+                await loadSavedActions();
+            } catch (e) {
+                logMsg('error', 'Save failed: ' + e.message, null, null);
+            }
+        }
+
+        function cancelSave() {
+            document.getElementById('save-dialog').classList.add('hidden');
+        }
+
+        async function loadAction(id) {
+            try {
+                const r = await fetch('/api/actions');
+                const actions = await r.json();
+                const a = actions.find(entry => entry.id === id);
+                if (!a) { logMsg('error', 'Action not found', null, null); return; }
+                document.getElementById('req-action').value = a.action;
+                setPayload(a.payload || {});
+                logSys(`Loaded action: ${a.label}`);
+            } catch (e) {
+                logMsg('error', 'Load failed: ' + e.message, null, null);
+            }
+        }
+
+        async function deleteAction(id) {
+            if (!confirm('Delete this saved action?')) return;
+            try {
+                const r = await fetch('/api/actions/' + id, {method: 'DELETE'});
+                if (!r.ok) { const e = await r.json(); logMsg('error', 'Delete failed: ' + (e.error||'unknown'), null, null); return; }
+                logSys('Deleted saved action');
+                await loadSavedActions();
+            } catch (e) {
+                logMsg('error', 'Delete failed: ' + e.message, null, null);
+            }
+        }
+
+        // ================================================================
+        //  CONNECTION
+        // ================================================================
+        function setConn(state) {
+            connected = state;
+            CONN_DOT.className = `w-2 h-2 rounded-full shrink-0 ${state ? 'bg-emerald-500' : 'bg-red-500'}`;
+            CONN_TXT.textContent = state ? 'Connected' : 'Disconnected';
+            CONN_TXT.className = `text-[11px] shrink-0 ${state ? 'text-emerald-400' : 'text-red-400'}`;
+            CONN_BTN.textContent = state ? 'Disconnect' : 'Connect';
+        }
+
+        function toggleConnect() {
+            if (connected && ws) { ws.close(); return; }
+            const url = document.getElementById('ws-url').value.trim();
+            if (!url) { logSys('WebSocket URL is required'); return; }
+            logSys(`Connecting to ${url}...`);
+            ws = new WebSocket(url);
+            ws.onopen = () => { setConn(true); logSys('Connected'); };
+            ws.onmessage = (e) => {
+                try {
+                    const m = JSON.parse(e.data);
+                    const a = m.action || 'unknown';
+                    const p = m.payload || {};
+                    logMsg('recv', a, p, e.data);
+                    handleAction(a, p);
+                } catch {
+                    logMsg('recv', '(non-JSON)', null, e.data);
+                }
+            };
+            ws.onclose = () => { setConn(false); logSys('Disconnected'); ws = null; };
+            ws.onerror = () => { logMsg('error', 'WebSocket error', null, null); };
+        }
+
+        // ================================================================
+        //  REQUEST BUILDER — Smart Fields
+        // ================================================================
+
+        /** Check if a container has any field-rows (direct children only). */
+        function _hasRows(container) {
+            return container.querySelector(':scope > .field-row') !== null;
+        }
+
+        /** Show the placeholder text in a container if it has no rows. */
+        function _checkPlaceholder(container) {
+            if (!_hasRows(container)) {
+                container.innerHTML = '<div class="text-gray-600 text-[10px] italic">Select a template or add fields.</div>';
+            }
+        }
+
+        /** Top-level placeholder check (for the main FIELDS container). */
+        function checkPlaceholder() { _checkPlaceholder(FIELDS); }
+
+        /** Clear all top-level fields. */
+        function clearFields() { FIELDS.innerHTML = '<div class="text-gray-600 text-[10px] italic">Select a template or add fields.</div>'; }
+
+        // ----------------------------------------------------------------
+        //  VALUE-CONTROL RENDERER
+        // ----------------------------------------------------------------
+        function renderValueControl(vc, type, value) {
+            vc.innerHTML = '';
+            switch (type) {
+                case 'boolean': {
+                    const boolVal = value === true || value === 'true';
+                    const sel = document.createElement('select');
+                    sel.className = 'w-full bg-gray-800 border border-gray-700 rounded px-1 py-1 text-[11px] focus:outline-none focus:border-cyan-500';
+                    sel.innerHTML = `<option value="true" ${boolVal?'selected':''}>true</option><option value="false" ${!boolVal?'selected':''}>false</option>`;
+                    vc.appendChild(sel);
+                    break;
+                }
+                case 'object': {
+                    const inner = document.createElement('div');
+                    inner.className = 'sub-fields space-y-1';
+                    vc.appendChild(inner);
+                    const addBtn = document.createElement('button');
+                    addBtn.className = 'text-gray-400 hover:text-cyan-400 text-[10px] px-1.5 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition mt-1';
+                    addBtn.textContent = '+ Add property';
+                    addBtn.onclick = () => addField('', undefined, 'string', inner);
+                    vc.appendChild(addBtn);
+                    if (value && typeof value === 'object' && !Array.isArray(value)) {
+                        for (const [k, v] of Object.entries(value)) {
+                            addField(k, v, undefined, inner);
+                        }
+                    } else {
+                        addField('', undefined, 'string', inner);
+                    }
+                    break;
+                }
+                case 'array': {
+                    const inner = document.createElement('div');
+                    inner.className = 'sub-items space-y-1';
+                    vc.appendChild(inner);
+                    const addBtn = document.createElement('button');
+                    addBtn.className = 'text-gray-400 hover:text-cyan-400 text-[10px] px-1.5 py-0.5 rounded bg-gray-800 hover:bg-gray-700 transition mt-1';
+                    addBtn.textContent = '+ Add item';
+                    addBtn.onclick = () => addArrayItem(undefined, 'string', inner);
+                    vc.appendChild(addBtn);
+                    if (value && Array.isArray(value)) {
+                        for (const item of value) {
+                            addArrayItem(item, undefined, inner);
+                        }
+                    } else {
+                        addArrayItem(undefined, 'string', inner);
+                    }
+                    break;
+                }
+                default: { // string, number
+                    const inp = document.createElement('input');
+                    inp.type = 'text';
+                    inp.placeholder = 'value';
+                    inp.value = value !== undefined && value !== null ? String(value) : '';
+                    inp.className = 'w-full bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] focus:outline-none focus:border-cyan-500 font-mono';
+                    vc.appendChild(inp);
+                    break;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        //  FIELD ROW — for object properties (has a key input)
+        // ----------------------------------------------------------------
+        function addField(key, value, type, container) {
+            container = container || FIELDS;
+            if (type === undefined && value !== undefined && value !== null) {
+                const t = typeof value;
+                type = (t === 'object') ? (Array.isArray(value) ? 'array' : 'object') : t;
+            }
+            type = type || 'string';
+
+            const d = document.createElement('div');
+            d.className = 'field-row flex items-start gap-1.5';
+            const types = ['string','number','boolean','object','array'];
+            const opts = types.map(t => `<option value="${t}" ${t===type?'selected':''}>${t}</option>`).join('');
+            d.innerHTML = `
+                <input type="text" placeholder="key" value="${esc(key||'')}"
+                    class="key-input flex-1 min-w-[50px] bg-gray-800 border border-gray-700 rounded px-1.5 py-1 text-[11px] focus:outline-none focus:border-cyan-500 font-mono">
+                <select class="ftype bg-gray-800 border border-gray-700 rounded px-1 py-1 text-[11px] focus:outline-none focus:border-cyan-500"
+                    onchange="changeType(this)">${opts}</select>
+                <div class="flex-[2] value-container min-w-[100px]"></div>
+                <button onclick="this.closest('.field-row').remove(); _checkPlaceholder(this.closest('.sub-fields, #payload-fields, .sub-items'))" class="text-red-500 hover:text-red-400 text-[11px] px-1 mt-1">✕</button>`;
+
+            const ph = container.querySelector('.text-gray-600.italic');
+            if (ph) ph.remove();
+            container.appendChild(d);
+
+            const vc = d.querySelector('.value-container');
+            renderValueControl(vc, type, value);
+        }
+
+        // ----------------------------------------------------------------
+        //  ARRAY ITEM ROW — no key, just type + value
+        // ----------------------------------------------------------------
+        function addArrayItem(value, type, container) {
+            container = container || FIELDS;
+            if (type === undefined && value !== undefined && value !== null) {
+                const t = typeof value;
+                type = (t === 'object') ? (Array.isArray(value) ? 'array' : 'object') : t;
+            }
+            type = type || 'string';
+
+            const idx = container.querySelectorAll(':scope > .field-row').length;
+            const d = document.createElement('div');
+            d.className = 'field-row flex items-start gap-1.5';
+            const types = ['string','number','boolean','object','array'];
+            const opts = types.map(t => `<option value="${t}" ${t===type?'selected':''}>${t}</option>`).join('');
+            d.innerHTML = `
+                <span class="nested-badge mt-1">[${idx}]</span>
+                <select class="ftype bg-gray-800 border border-gray-700 rounded px-1 py-1 text-[11px] focus:outline-none focus:border-cyan-500"
+                    onchange="changeType(this)">${opts}</select>
+                <div class="flex-[2] value-container min-w-[100px]"></div>
+                <button onclick="this.closest('.field-row').remove(); _checkPlaceholder(this.closest('.sub-items'))" class="text-red-500 hover:text-red-400 text-[11px] px-1 mt-1">✕</button>`;
+
+            const ph = container.querySelector('.text-gray-600.italic');
+            if (ph) ph.remove();
+            container.appendChild(d);
+
+            const vc = d.querySelector('.value-container');
+            renderValueControl(vc, type, value);
+        }
+
+        // ----------------------------------------------------------------
+        //  TYPE CHANGER
+        // ----------------------------------------------------------------
+        function changeType(sel) {
+            const row = sel.closest('.field-row');
+            const vc = row.querySelector('.value-container');
+            renderValueControl(vc, sel.value, undefined);
+        }
+
+        // ----------------------------------------------------------------
+        //  PAYLOAD EXTRACTOR — recursively read nested fields
+        // ----------------------------------------------------------------
+        function getValueFromContainer(vc, type) {
+            switch (type) {
+                case 'string': {
+                    const inp = vc.querySelector('input');
+                    return inp ? inp.value : '';
+                }
+                case 'number': {
+                    const inp = vc.querySelector('input');
+                    const v = inp ? inp.value : '';
+                    return v === '' ? '' : Number(v);
+                }
+                case 'boolean': {
+                    const sel = vc.querySelector('select');
+                    return sel ? sel.value === 'true' : false;
+                }
+                case 'object': {
+                    const sub = vc.querySelector('.sub-fields');
+                    if (!sub) return {};
+                    return readKeyedFields(sub);
+                }
+                case 'array': {
+                    const sub = vc.querySelector('.sub-items');
+                    if (!sub) return [];
+                    return readArrayItems(sub);
+                }
+                default:
+                    return null;
+            }
+        }
+
+        function readKeyedFields(container) {
+            const rows = container.querySelectorAll(':scope > .field-row');
+            const obj = {};
+            rows.forEach(r => {
+                const keyInput = r.querySelector('.key-input');
+                const sel = r.querySelector('.ftype');
+                const k = keyInput ? keyInput.value.trim() : '';
+                if (!k) return;
+                const t = sel.value;
+                const vc = r.querySelector('.value-container');
+                obj[k] = getValueFromContainer(vc, t);
+            });
+            return obj;
+        }
+
+        function readArrayItems(container) {
+            const rows = container.querySelectorAll(':scope > .field-row');
+            const arr = [];
+            rows.forEach(r => {
+                const sel = r.querySelector('.ftype');
+                const t = sel.value;
+                const vc = r.querySelector('.value-container');
+                arr.push(getValueFromContainer(vc, t));
+            });
+            return arr;
+        }
+
+        function getPayload() {
+            return readKeyedFields(FIELDS);
+        }
+
+        // ----------------------------------------------------------------
+        //  PAYLOAD LOADER — recursively set fields from an object
+        // ----------------------------------------------------------------
+        function setPayload(payload) {
+            clearFields();
+            if (!payload || Object.keys(payload).length === 0) { addField('', '', 'string'); return; }
+            for (const [k, v] of Object.entries(payload)) {
+                addField(k, v, undefined);
+            }
+        }
+
+        function tmpl(action, payload) {
+            REQ_ACT.value = action;
+            setPayload(payload);
+            logSys(`Loaded template: ${action}`);
+        }
+
+        function sendStructured() {
+            if (!connected||!ws) { logMsg('error','Not connected',null,null); return; }
+            const action = REQ_ACT.value.trim();
+            if (!action) { logMsg('error','Action is required',null,null); return; }
+            const payload = getPayload();
+            const msg = JSON.stringify({action,payload});
+            ws.send(msg);
+            logMsg('sent', action, payload, msg);
+        }
+
+        // ================================================================
+        //  RAW JSON EDITOR
+        // ================================================================
+        function switchTab(tab) {
+            currentTab = tab;
+            ['structured','raw'].forEach(t => {
+                document.getElementById('tab-'+t).className = t===tab
+                    ? 'text-[10px] text-cyan-400 border-b-2 border-cyan-400 pb-0.5 transition'
+                    : 'text-[10px] text-gray-500 hover:text-cyan-400 pb-0.5 transition';
+                document.getElementById('editor-'+t).classList.toggle('hidden', t!==tab);
+            });
+            if (tab === 'raw') syncRaw();
+        }
+
+        function syncRaw() {
+            const action = REQ_ACT.value.trim();
+            const payload = getPayload();
+            RAW_JSON.value = JSON.stringify({action,payload}, null, 2);
+        }
+
+        function parseRaw() {
+            try {
+                const o = JSON.parse(RAW_JSON.value);
+                REQ_ACT.value = o.action || '';
+                setPayload(o.payload || {});
+                logSys('Parsed raw JSON to fields');
+            } catch { logMsg('error','Invalid JSON',null,null); }
+        }
+
+        function sendRaw() {
+            if (!connected||!ws) { logMsg('error','Not connected',null,null); return; }
+            const v = RAW_JSON.value.trim();
+            if (!v) return;
+            try {
+                const o = JSON.parse(v);
+                ws.send(v);
+                logMsg('sent', o.action||'(raw)', o.payload, v);
+            } catch { logMsg('error','Invalid JSON',null,null); }
+        }
+
+        // ================================================================
+        //  RESPONSE VIEWER
+        // ================================================================
+        function switchRespView(view) {
+            currentView = view;
+            ['structured','raw'].forEach(v => {
+                document.getElementById('rview-'+v).className = v===view
+                    ? 'text-cyan-400 border-b-2 border-cyan-400 pb-0.5 text-[10px] transition'
+                    : 'pb-0.5 text-gray-500 hover:text-cyan-400 text-[10px] transition';
+            });
+            document.getElementById('response-panel').classList.toggle('hidden', view!=='structured');
+            document.getElementById('raw-log-panel').classList.toggle('hidden', view!=='raw');
+        }
+
+        function logMsg(dir, summary, payload, raw) {
+            msgCount++;
+            MSG_CNT.textContent = String(msgCount);
+            RESP_CNT.textContent = `${msgCount} message${msgCount!==1?'s':''}`;
+            addStructured(dir, summary, payload, raw);
+            addRawLog(dir, raw||summary);
+            addHistory(dir, summary);
+        }
+
+        function logSys(summary) { logMsg('system', summary, null, null); }
+
+        function addStructured(dir, summary, payload, raw) {
+            const icons = {sent:'⇨',recv:'⇦',error:'✗',system:'⚡'};
+            const cls = {sent:'msg-sent',recv:'msg-recv',error:'msg-error',system:'msg-sys'};
+            const colors = {sent:'text-cyan-400',recv:'text-emerald-400',error:'text-red-400',system:'text-purple-400'};
+            const el = document.createElement('div');
+            el.className = `log-entry fade-in ${cls[dir]||''} bg-gray-900/40 rounded-lg p-2.5`;
+            let body = '';
+            if (payload !== undefined && payload !== null) {
+                body = `<div class="text-[11px]">${renderJSON(payload,0)}</div>`;
+            } else if (raw) {
+                body = `<div class="text-[11px] text-gray-400 break-all">${esc(raw)}</div>`;
+            }
+            el.innerHTML = `
+                <div class="flex items-center justify-between mb-1">
+                    <div class="flex items-center gap-1.5">
+                        <span class="${colors[dir]||'text-gray-400'} font-bold">${icons[dir]||'•'}</span>
+                        <span class="font-semibold text-[11px] ${colors[dir]||'text-gray-400'}">${esc(summary)}</span>
+                        <span class="text-gray-600 text-[10px]">${dir.toUpperCase()}</span>
+                    </div>
+                    <div class="flex gap-1">
+                        ${raw?`<button onclick="navigator.clipboard.writeText(this._r); this.textContent='✓'; setTimeout(()=>this.textContent='⎘',800)" _r="${esc(raw)}" class="text-gray-600 hover:text-cyan-400 text-[10px] px-1" title="Copy">⎘</button>`:''}
+                        <button onclick="this.closest('.log-entry').remove()" class="text-gray-600 hover:text-red-400 text-[10px] px-1" title="Remove">✕</button>
+                    </div>
+                </div>${body}`;
+            const ph = RESP.querySelector('.text-gray-700');
+            if (ph && ph.classList.contains('text-center')) ph.remove();
+            RESP.insertBefore(el, RESP.firstChild);
+        }
+
+        function addRawLog(dir, text) {
+            const colors = {sent:'text-cyan-400',recv:'text-emerald-400',error:'text-red-400',system:'text-purple-400'};
+            const labels = {sent:'⇨ SENT',recv:'⇦ RECV',error:'✗ ERROR',system:'⚡ SYS'};
+            const el = document.createElement('div');
+            el.className = `log-entry fade-in flex gap-2 ${colors[dir]||'text-gray-300'} text-[11px]`;
+            el.innerHTML = `<span class="text-gray-600 shrink-0 text-[10px] w-14">${labels[dir]||'•'}</span><span class="break-all">${esc(text)}</span>`;
+            const ph = RAW_LOG.querySelector('.text-gray-700');
+            if (ph && ph.classList.contains('text-center')) ph.remove();
+            RAW_LOG.insertBefore(el, RAW_LOG.firstChild);
+        }
+
+        function addHistory(dir, summary) {
+            const colors = {sent:'text-cyan-400',recv:'text-emerald-400',error:'text-red-400',system:'text-purple-400'};
+            const icons = {sent:'⇨',recv:'⇦',error:'✗',system:'⚡'};
+            const el = document.createElement('div');
+            el.className = `flex gap-1.5 items-center py-0.5 px-1 rounded hover:bg-gray-800/50 cursor-pointer text-[10px]`;
+            el.innerHTML = `<span class="${colors[dir]||'text-gray-500'}">${icons[dir]||'•'}</span><span class="truncate ${dir==='system'?'text-gray-500':'text-gray-300'}">${esc(summary)}</span>`;
+            const ph = HIST.querySelector('.text-gray-700');
+            if (ph && ph.classList.contains('text-center')) ph.remove();
+            HIST.insertBefore(el, HIST.firstChild);
+            if (HIST.children.length > 200) HIST.lastChild.remove();
+        }
+
+        // ================================================================
+        //  JSON RENDERER
+        // ================================================================
+        function renderJSON(obj, depth) {
+            if (obj===null||obj===undefined) return '<span class="json-null">null</span>';
+            if (typeof obj==='string') return `<span class="json-str">"${esc(obj)}"</span>`;
+            if (typeof obj==='number') return `<span class="json-num">${obj}</span>`;
+            if (typeof obj==='boolean') return `<span class="json-bool">${obj}</span>`;
+            if (Array.isArray(obj)) {
+                if (obj.length===0) return '<span class="json-br">[]</span>';
+                const items = obj.map((item,i) =>
+                    `<div style="padding-left:${(depth+1)*16}px">${renderJSON(item,depth+1)}${i<obj.length-1?',':''}</div>`
+                ).join('');
+                return `<div><span class="json-br tree-toggle" onclick="toggleTree(this)">▼ [</span>${items}<div style="padding-left:${depth*16}px"><span class="json-br">]</span></div></div>`;
+            }
+            if (typeof obj==='object') {
+                const keys = Object.keys(obj);
+                if (keys.length===0) return '<span class="json-br">{}</span>';
+                const items = keys.map((key,i) =>
+                    `<div style="padding-left:${(depth+1)*16}px"><span class="json-key">"${esc(key)}"</span><span class="json-br">: </span>${renderJSON(obj[key],depth+1)}${i<keys.length-1?',':''}</div>`
+                ).join('');
+                return `<div><span class="json-br tree-toggle" onclick="toggleTree(this)">▼ {</span>${items}<div style="padding-left:${depth*16}px"><span class="json-br">}</span></div></div>`;
+            }
+            return String(obj);
+        }
+
+        function toggleTree(el) {
+            const parent = el.parentElement;
+            const children = parent.querySelectorAll(':scope > div');
+            if (el.textContent.startsWith('▼')) {
+                el.textContent = '▶ ' + el.textContent.slice(2);
+                children.forEach(c => c.style.display = 'none');
+            } else {
+                el.textContent = '▼ ' + el.textContent.slice(2);
+                children.forEach(c => c.style.display = '');
+            }
+        }
+
+        // ================================================================
+        //  SERVER ACTION HANDLER
+        // ================================================================
+        function handleAction(action, payload) {
+            if (action === 'list_models_response') {
+                const models = payload.models || [];
+                document.getElementById('files-panel').innerHTML = models.length
+                    ? models.map(m => `<div class="text-gray-400 truncate">◆ ${esc(m)}</div>`).join('')
+                    : '<div class="text-gray-600">No models loaded.</div>';
+            }
+            if (action === 'file_list') {
+                const files = payload.files || [];
+                const p = document.getElementById('files-panel');
+                if (!files.length) { p.innerHTML = '<div class="text-gray-600">No files.</div>'; return; }
+                p.innerHTML = files.map(f =>
+                    `<div class="flex justify-between items-center py-0.5 border-b border-gray-800 last:border-0">
+                        <span class="truncate max-w-[130px]" title="${esc(f.name)}">${esc(f.name)}</span>
+                        <button onclick="tmpl('delete_file',{file_id:'${esc(f.id)}'})" class="text-red-500 hover:text-red-400 text-[9px] ml-1">del</button>
+                     </div>`
+                ).join('');
+            }
+            if (action === 'delete_file_success' && ws && connected)
+                ws.send(JSON.stringify({action:'list_files',payload:{}}));
+            if ((action === 'file_download_completed' || action === 'file_download_initiated') && action === 'file_download_completed' && ws && connected)
+                ws.send(JSON.stringify({action:'list_files',payload:{}}));
+        }
+
+        // ================================================================
+        //  UI HELPERS
+        // ================================================================
+        function toggleGroup(el) {
+            const arrow = el.querySelector('.arrow');
+            const content = el.nextElementSibling;
+            content.style.display = content.style.display === 'none' ? '' : 'none';
+            arrow.textContent = content.style.display === 'none' ? '▶' : '▼';
+        }
+        function clearAll() {
+            msgCount = 0;
+            MSG_CNT.textContent = '0';
+            RESP_CNT.textContent = '0 messages';
+            RESP.innerHTML = '<div class="text-gray-700 text-[11px] text-center mt-16 italic">Build a message and click <span class="text-cyan-500">Send</span>.</div>';
+            RAW_LOG.innerHTML = '<div class="text-gray-700 text-[11px] text-center mt-16 italic">Switch to Raw Log to see all raw messages.</div>';
+            HIST.innerHTML = '<div class="text-gray-700 italic text-center mt-8">No messages yet.</div>';
+        }
+        function esc(s) {
+            if (typeof s!=='string') return String(s);
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+        }
+        document.addEventListener('keydown', e => {
+            if ((e.ctrlKey||e.metaKey) && e.key==='Enter') {
+                e.preventDefault();
+                if (currentTab==='raw') sendRaw(); else sendStructured();
+            }
+        });
+        document.querySelectorAll('.group-content').forEach(el => el.style.display = '');
+        loadSavedActions();
+    </script>
+
+    <!-- Save Action Dialog -->
+    <div id="save-dialog" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+        <div class="bg-gray-900 border border-gray-700 rounded-lg shadow-xl p-5 w-80">
+            <h3 class="text-sm font-semibold text-cyan-400 mb-3">Save Action</h3>
+            <label class="text-[10px] text-gray-500 uppercase tracking-wider block mb-1">Label</label>
+            <input id="save-dialog-label" type="text" class="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-[11px] focus:outline-none focus:border-cyan-500 mb-4" placeholder="Enter a label for this action" onkeydown="if(event.key==='Enter'){event.preventDefault();confirmSave();}if(event.key==='Escape'){event.preventDefault();cancelSave();}">
+            <div class="flex justify-end gap-2">
+                <button onclick="cancelSave()" class="bg-gray-700 hover:bg-gray-600 px-4 py-1.5 rounded text-[11px] transition">Cancel</button>
+                <button onclick="confirmSave()" class="bg-emerald-700 hover:bg-emerald-600 px-4 py-1.5 rounded text-[11px] font-semibold transition">Save</button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

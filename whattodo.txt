@@ -1,7 +1,0 @@
-Add demo assets --
-
-test for kaggle
-    Note: the actual segmentation runner is still the stub adapter, so this prepares the SAM repo/model artifact correctly but does not yet produce real SAM masks. Your local .gitignore change is still untouched.    
-
-# test for local machine
-# test for colab
