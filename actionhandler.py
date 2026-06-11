@@ -34,7 +34,8 @@ import threading
 # delete_inference_task: {"action": "delete_inference_task", "payload": {"task_id": "1234"}} -> deletes the inference task with the given task_id from the server and also removes any associated resources 
 # start_inference_from_queue: {"action": "start_inference_from_queue", "payload": {}} -> starts the next inference task in the queue and returns the task_id of the started task or a message indicating that the queue is empty
 
-
+# delete_inference_result: {"action": "delete_inference_result", "payload": {"chunk_id": "1234"}} -> deletes the inference result for the given chunk_id from the server
+# delete_inference_result_of_task: {"action": "delete_inference_result_of_task", "payload": {"task_id": "1234"}} -> deletes the inference result for the given task_id from the server
 
 
 
@@ -52,6 +53,8 @@ import threading
 # inference_stage_plus_progress: {"action": "inference_stage_plus_progress", "payload": {"task_id": "1234", "progress": 50, "stage": "stage_name"}} -> sent periodically to update the client about the inference progress of a task
 # inference_completed: {"action": "inference_completed", "payload": {"task_id": "1234", "result": "path to result file"}} -> sent when an inference task is completed with the path to the result file
 # inference_failed: {"action": "inference_failed", "payload": {"task_id": "1234", "error": "error message"}} -> sent when an inference task fails with the error message    
+
+
 
 
 
@@ -484,5 +487,124 @@ async def handle_fetch_inference_chunk(websocket: WebSocket, data: dict, context
                 "chunks": chunk_list
             }
         }))
+
+
+@register("delete_inference_result")
+async def handle_delete_inference_result(websocket: WebSocket, data: dict, context: Context):
+    """Delete a single inference result chunk by chunk_id.
+
+    Payload:
+        chunk_id (str): ID of the chunk to delete.
+
+    Response actions:
+        inference_result_deleted: chunk was deleted
+        inference_result_delete_error: error message
+    """
+    chunk_id = data.get("chunk_id")
+    if not chunk_id:
+        send_action(context, "inference_result_delete_error", {
+            "error": "No chunk_id provided"
+        })
+        return
+
+    def worker(chunk_id: str, context: Context):
+        chunk_info = context.inference_results.get(chunk_id)
+        if not chunk_info:
+            send_action(context, "inference_result_delete_error", {
+                "error": f"Chunk {chunk_id} not found"
+            })
+            return
+
+        task_id = chunk_info.get("task_id")
+
+        # Delete the pickle file on disk
+        save_file = chunk_info.get("save_file")
+        if save_file and os.path.exists(save_file):
+            try:
+                os.remove(save_file)
+            except Exception as e:
+                logging.error(f"Failed to delete chunk file {save_file}: {e}")
+
+        # Remove from in-memory dict
+        del context.inference_results[chunk_id]
+        logging.info(f"Deleted inference result chunk {chunk_id} for task {task_id}")
+
+        send_action(context, "inference_result_deleted", {
+            "chunk_id": chunk_id,
+            "task_id": task_id
+        })
+
+    thread = threading.Thread(target=worker, args=(chunk_id, context))
+    thread.daemon = True
+    thread.start()
+
+
+@register("delete_inference_result_of_task")
+async def handle_delete_inference_result_of_task(websocket: WebSocket, data: dict, context: Context):
+    """Delete all inference results for a given task_id.
+
+    Payload:
+        task_id (str): ID of the task whose results should be deleted.
+
+    Response actions:
+        inference_results_of_task_deleted: all results for the task were deleted
+        inference_result_delete_error: error message
+    """
+    task_id = data.get("task_id")
+    if not task_id:
+        send_action(context, "inference_result_delete_error", {
+            "error": "No task_id provided"
+        })
+        return
+
+    def worker(task_id: str, context: Context):
+        # Find all chunks belonging to this task
+        chunks_to_delete = []
+        for cid, info in list(context.inference_results.items()):
+            if isinstance(info, dict) and info.get("task_id") == task_id:
+                chunks_to_delete.append((cid, info))
+
+        if not chunks_to_delete:
+            send_action(context, "inference_result_delete_error", {
+                "error": f"No results found for task {task_id}"
+            })
+            return
+
+        deleted_count = 0
+        for cid, info in chunks_to_delete:
+            # Delete the pickle file on disk
+            save_file = info.get("save_file")
+            if save_file and os.path.exists(save_file):
+                try:
+                    os.remove(save_file)
+                except Exception as e:
+                    logging.error(f"Failed to delete chunk file {save_file}: {e}")
+
+            # Remove from in-memory dict
+            del context.inference_results[cid]
+            deleted_count += 1
+
+        # Also remove the results directory if it exists
+        results_dir = os.path.join("results", task_id)
+        if os.path.exists(results_dir):
+            try:
+                shutil.rmtree(results_dir)
+                logging.info(f"Removed results directory {results_dir}")
+            except Exception as e:
+                logging.error(f"Failed to remove results directory {results_dir}: {e}")
+
+        # Also clean up the task-level dict entry if it exists
+        if task_id in context.inference_results:
+            del context.inference_results[task_id]
+
+        logging.info(f"Deleted {deleted_count} inference result chunks for task {task_id}")
+        send_action(context, "inference_results_of_task_deleted", {
+            "task_id": task_id,
+            "deleted_count": deleted_count
+        })
+
+    thread = threading.Thread(target=worker, args=(task_id, context))
+    thread.daemon = True
+    thread.start()
 
 
