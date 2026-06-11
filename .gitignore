@@ -5,3 +5,6 @@ assets/
 projects/
 __pycache__/
 *.py[cod]
+
+files/
+results/
