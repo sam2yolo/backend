@@ -439,19 +439,21 @@ class yoloHandler(ModelHandler):
 
             logging.debug(f'saving result as pickle')
 
+            
+
             # --- Save batch result as pickle and register chunk ---
             chunk_id = str(uuid.uuid4())[:8]
             save_file = os.path.join(save_dir, f'chunk-{chunk_index}.pkl')
             with open(save_file, 'wb') as f:
                 pickle.dump(batch_results, f)
 
-            context.inference_results[task_id][chunk_id] = [{
-                'chunk_id': chunk_id,
+            context.inference_results[chunk_id] = {
+                'task_id': task_id,
                 'chunk_index': chunk_index,
                 'save_file': save_file,
                 'frame_count': len(batch_results),
                 'frames': batch_frame_indices
-            }]
+            }
 
             send_action(context, 'inference_task_chunk_result', {
                 'chunk_id': chunk_id,
@@ -462,9 +464,6 @@ class yoloHandler(ModelHandler):
 
             chunk_index += 1
             # batch_frames goes out of scope → memory freed
-
-        # --- Save master annotations JSON ---
-        self._save_annotations_json(all_annotations, save_dir, task_id, context)
 
         send_action(context, "inference_completed", {
             "task_id": task_id,

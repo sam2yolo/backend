@@ -52,6 +52,12 @@ class Context:
         self._worker_threads = []
         self._running = False
 
+    def get_inference_result_path(self, id):
+        if not id in self.inference_results:
+            return None
+        
+        return self.inference_results[id]['save_file']
+
     def start_worker(self):
         """Start the response dispatcher thread.
         

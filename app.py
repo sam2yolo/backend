@@ -1,6 +1,7 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from actionhandler import handle_action
+import io
 
 from modelhandler import yoloHandler
 
@@ -111,6 +112,26 @@ async def websocket_endpoint(websocket: WebSocket):
         logging.error(f'Error in websocket handler: {type(e).__name__}: {e}')
 
         context.active_websocket = None
+
+
+@app.get('/inference_result')
+async def get_inference_result(id:str):
+
+    save_file_path = context.get_inference_result_path(id)
+    if not save_file_path:
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+    
+    with open(save_file_path, "rb") as f:
+        data = f.read()
+
+    byte_io = io.BytesIO(data)
+
+    return StreamingResponse(
+            byte_io, 
+            media_type="application/octet-stream"
+        )                            
+
+
 
 if __name__ == "__main__":
     import uvicorn
