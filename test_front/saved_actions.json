@@ -27,5 +27,18 @@
       "iou": 0.45
     },
     "label": "Create Inference Task Yolo"
+  },
+  {
+    "id": "4",
+    "action": "create_inference_task",
+    "payload": {
+      "batch": 16,
+      "conf": 0.25,
+      "file_id": "e54d6b22-7d90-4e",
+      "file_type": "video",
+      "iou": 0.45,
+      "model_name": "yolo"
+    },
+    "label": "Create Task Small Batch"
   }
 ]

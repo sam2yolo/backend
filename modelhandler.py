@@ -349,6 +349,8 @@ class yoloHandler(ModelHandler):
             return
         file_path = file_info["path"] if isinstance(file_info, dict) else file_info
 
+        logging.info(f'file_path: {file_path}')
+
         # Prepare output directories for training-ready dataset format
         dataset_dir = os.path.join(save_dir, "dataset")
         images_dir = os.path.join(dataset_dir, "images")
@@ -404,46 +406,38 @@ class yoloHandler(ModelHandler):
         for batch_indices in frame_batches:
             if context.stop_event.is_set():
                 send_action(context, "task_cancelled", {"id": task_id})
+                logging.info('Task cancelled')
                 return
 
             # --- Extract batch frames from video (memory-bound) ---
+            logging.debug(f'{task_id}: Extracing frames for batch {chunk_index}')
             batch_frames = self._extract_frames_from_video(file_path, batch_indices)
             if not batch_frames:
                 continue
 
             # --- Run inference on this batch ---
-            batch_results = []
-            for frame_idx, frame in batch_frames:
-                # Save frame as temp image for YOLO
-                frame_key = f"frame_{frame_idx:06d}"
-                img_filename = f"{frame_key}.jpg"
-                img_path = os.path.join(images_dir, img_filename)
-                cv2.imwrite(img_path, frame)
+            logging.debug(f'{task_id}: Running inference for batch {chunk_index}')
+            
+            predict_kwargs = dict(conf=conf, iou=iou,verbose=True, classes=classes)
+            if imgsz is not None:
+                predict_kwargs['imgsz'] = imgsz
+            # Separate frame indices and arrays — YOLO only accepts arrays
+            
+            batch_frame_indices = [idx for idx, _ in batch_frames]
+            batch_frame_arrays = [arr for _, arr in batch_frames]
 
-                predict_kwargs = dict(conf=conf, iou=iou, classes=classes)
-                if imgsz is not None:
-                    predict_kwargs['imgsz'] = imgsz
-                results = self.model.predict(img_path, **predict_kwargs)
+            batch_results = self.model.predict(batch_frame_arrays, **predict_kwargs)
+            
+            
+            processed_count += len(batch_frames)
+            progress = int((processed_count / total_frames_to_process) * 100)
+            send_action(context, "inference_stage_plus_progress", {
+                "task_id": task_id,
+                "progress": progress,
+                "stage": f"Processing frame {processed_count}/{total_frames_to_process}"
+            })
 
-                if results and len(results) > 0:
-                    r = results[0]
-                    annotation = self._extract_frame_annotation(
-                        r, frame_idx, images_dir, masks_dir, save_dir
-                    )
-                    if annotation:
-                        all_annotations.append(annotation)
-                        batch_results.append({
-                            'frame_idx': frame_idx,
-                            'annotation': annotation
-                        })
-
-                processed_count += 1
-                progress = int((processed_count / total_frames_to_process) * 100)
-                send_action(context, "inference_stage_plus_progress", {
-                    "task_id": task_id,
-                    "progress": progress,
-                    "stage": f"Processing frame {processed_count}/{total_frames_to_process}"
-                })
+            logging.debug(f'saving result as pickle')
 
             # --- Save batch result as pickle and register chunk ---
             chunk_id = str(uuid.uuid4())[:8]
@@ -456,7 +450,7 @@ class yoloHandler(ModelHandler):
                 'chunk_index': chunk_index,
                 'save_file': save_file,
                 'frame_count': len(batch_results),
-                'frames': [r['frame_idx'] for r in batch_results]
+                'frames': batch_frame_indices
             }]
 
             send_action(context, 'inference_task_chunk_result', {
@@ -775,11 +769,27 @@ class yoloHandler(ModelHandler):
     @staticmethod
     def _get_frame_count(video_path):
         try:
-            probe = ffmpeg.probe(
-                video_path, select_streams='v:0',
-                count_packets=None, show_entries='stream=nb_read_packets'
+            
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-count_frames",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "json",
+                video_path,
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
             )
-            return int(probe['streams'][0]['nb_read_packets'])
+
+            data = json.loads(result.stdout)
+            return int(data["streams"][0]["nb_read_frames"])
+
         except Exception as e:
             logging.error(f"Failed to get frame count: {e}")
             return None
