@@ -26,6 +26,8 @@ import threading
 
 # download_file_wget: {"action": "download_file_wget", "payload": {"url": "https://example.com/video.mp4"}} -> returns a unique video_id that can be used to track the download progress also video id can be used to get video download path
 # download_file_google_drive: {"action": "download_file_google_drive", "payload": {"file_id": "1a2b3c4d5e6f7g8h9i0j"}} -> returns a unique video_id that can be used to track the download progress also video id can be used to get video download path
+# upload_file: {"action":"upload_file"}
+
 # list_files: {"action": "list_files", "payload": {}} -> returns a list of all downloaded files with their file_id, file_name and file_path
 # delete_file: {"action": "delete_file", "payload": {"file_id": "1234"}} -> deletes the file with the given file_id from the server and also removes the entry from files_dict in context
 

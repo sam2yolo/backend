@@ -1,7 +1,8 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from actionhandler import handle_action
 import io
+import os
 
 from modelhandler import yoloHandler
 
@@ -19,8 +20,10 @@ logging.basicConfig(
 
 # create a context instance to hold the global variables and constants used in the application and also to register the action handlers
 context = Context()
-
 context.models_dict['yolo'] = yoloHandler
+
+
+
 
 
 @asynccontextmanager
@@ -132,7 +135,53 @@ async def get_inference_result(id:str):
         )                            
 
 
+@app.post('/upload')
+async def handle_file_upload(file:UploadFile = File(...)):
+    
+    # generate file_id
+
+    file_id = str(uuid.uuid4())[:16]
+    while os.path.exists(f"files/{file_id}"):
+        file_id = str(uuid.uuid4())[:16]
+
+    file_name = file.filename
+
+    # Create file path
+    file_path = f"files/{file_id}"
+    
+    # read file
+    content = file.read()
+
+    # write file
+    with open(file_path, "wb") as f:
+            f.write(content)
+
+    
+    file_meta = {"path": f"files/{file_id}", "name": file_name}
+
+    # save file meta to context:
+    context.files_dict[file_id] = {"path": f"files/{file_id}", "name": file_name}
+
+
+    return JSONResponse({
+        'status':200,
+        'file_id':file_id
+    })
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+#!/bin/bash
+
+# script is non interactive
+
+# check if `samtoyolo_conda_environment` environment exists
+# if does not exist
+#   install latest miniconda with python version 3.9
+#   activate environment
+
+# run pip install -r requirements.txt
+
+
+
+
