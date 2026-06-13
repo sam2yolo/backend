@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+
+# install tmux
+
+apt install tmux
+
+
+
 set -euo pipefail
 
 ENV_NAME="samtoyolo_conda_environment"
