@@ -470,6 +470,9 @@ class yoloHandler(ModelHandler):
         
         Returns list of (frame_index, frame_numpy) tuples.
         Only loads requested frames into memory at once.
+        
+        Uses sequential scan only — seeking via cap.set(CAP_PROP_POS_FRAMES)
+        breaks on HEVC/H.265 videos because reference frames are missing.
         """
         import cv2
         cap = cv2.VideoCapture(video_path)
@@ -478,26 +481,14 @@ class yoloHandler(ModelHandler):
 
         frames = []
         frame_set = set(frame_indices)
-        seek_threshold = 100
-
-        if len(frame_indices) < seek_threshold:
-            # Sparse: seek directly to each frame
-            for idx in sorted(frame_indices):
-                if idx != 0:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ret, frame = cap.read()
-                if ret:
-                    frames.append((idx, frame.copy()))
-        else:
-            # Dense: sequential scan
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx in frame_set:
-                    frames.append((frame_idx, frame.copy()))
-                frame_idx += 1
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx in frame_set:
+                frames.append((frame_idx, frame.copy()))
+            frame_idx += 1
 
         cap.release()
         return frames

@@ -1,0 +1,19 @@
+# ── Core server ──
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6           # required by FastAPI for file uploads
+
+# ── Inference engine ──
+ultralytics>=8.0.0                # YOLO model (includes torch, torchvision)
+opencv-python-headless>=4.8.0     # cv2 (headless = no GUI deps)
+numpy>=1.24.0
+
+# ── Video processing ──
+ffmpeg-python>=0.2.0              # ffmpeg binding
+
+# ── Networking / Downloads ──
+requests>=2.28.0
+gdown>=4.7.0                      # Google Drive file download
+
+# ── Dev / optional ──
+# flask>=3.0.0                    # only needed for test_front/app.py

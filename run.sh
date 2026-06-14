@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 
-# install tmux
+apt update
 
-apt install tmux
+# install utilities
+
+apt install tmux git
+git clone https://github.com/sam2yolo/backend.git
+
+cd backend
 
 APP_PORT=8000
 
 # initiate frpc
 
-## create room
+cp frpc /bin
+chmod +x /bin
+
+BROKER=http://163.61.236.112:7001                                            
+API_TOKEN='VKl7VeOSKDBLPheW7hdKyZQ5iq//B+1SSBXCkQpZ9HQ='                   
+FRPS_TOKEN='kEfip7iduT8PpQ4PDsT1QCEtB0wI+nSENhcUjh7oBUM='
+ROOM_ID=$1
+ROOM_SECRET=$2
+NAME=$3
 
 
 
-create_room
-
-
-# run
-tmux new -d -s s1 -n frpc "frpc -c frpc.toml"
-
+tmux new -d -s s1 -n tunnel "./quicktunnel --broker $BROKER --room-id $ROOM_ID --room-secret $ROOM_SECRET --api-token $API_TOKEN --cleanup --frps-token $FRPS_TOKEN $NAME $APP_PORT"
 
 set -euo pipefail
 
@@ -45,6 +53,11 @@ if ! command -v conda >/dev/null 2>&1; then
 
     export PATH="$MINICONDA_DIR/bin:$PATH"
 fi
+
+
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 
 # Initialize conda for non-interactive shell
 eval "$(conda shell.bash hook)"

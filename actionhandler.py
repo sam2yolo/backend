@@ -35,6 +35,7 @@ import threading
 # create_inference_task: {"action": "create_inference_task", "payload": {"model_name": "yolov11-seg", "file_id": "1234"}} -> creates an inference task for the given model and file and returns a unique task_id that can be used to track the inference progress
 # delete_inference_task: {"action": "delete_inference_task", "payload": {"task_id": "1234"}} -> deletes the inference task with the given task_id from the server and also removes any associated resources 
 # start_inference_from_queue: {"action": "start_inference_from_queue", "payload": {}} -> starts the next inference task in the queue and returns the task_id of the started task or a message indicating that the queue is empty
+# stop_inference_task
 
 # delete_inference_result: {"action": "delete_inference_result", "payload": {"chunk_id": "1234"}} -> deletes the inference result for the given chunk_id from the server
 # delete_inference_result_of_task: {"action": "delete_inference_result_of_task", "payload": {"task_id": "1234"}} -> deletes the inference result for the given task_id from the server
@@ -610,3 +611,47 @@ async def handle_delete_inference_result_of_task(websocket: WebSocket, data: dic
     thread.start()
 
 
+@register("stop_inference_task")
+async def handle_stop_inference_task(websocket: WebSocket, data: dict, context: Context):
+    """Stop the currently running inference task.
+
+    Cancels the task that is actively being processed.
+    Does not remove queued tasks — only stops the running inference loop.
+
+    Payload:
+        task_id (str, optional): ID of the task to stop.
+            If omitted, stops whatever is currently running.
+
+    Response actions:
+        task_cancelled: the running task was stopped
+        no_task_running: no task was currently running
+    """
+    if not context.modelHandler:
+        send_action(context, 'model_handler_not_loaded_error')
+        logging.error('Model handler not loaded')
+        return
+
+    task_id = data.get("task_id")
+    current = context.modelHandler.current_task
+
+    # If a specific task_id was requested, verify it's the one running
+    if task_id:
+        if not current or current.get("id") != task_id:
+            send_action(context, "task_stop_error", {
+                "error": f"Task {task_id} is not currently running"
+            })
+            return
+
+    if not current:
+        send_action(context, "no_task_running", {
+            "message": "No task is currently running"
+        })
+        return
+
+    running_task_id = current.get("id")
+    context.modelHandler.cancelled_tasks.add(running_task_id)
+    context.modelHandler.running = False
+    context.stop_event.set()
+
+    logging.info(f"Stopping inference task {running_task_id}")
+    send_action(context, "task_cancelled", {"id": running_task_id})

@@ -73,7 +73,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logging.info('New websocket connection established')
 
     # Re-enable the stop event so new workers can run
-    # context.stop_event.clear()
+    context.stop_event.clear()
 
     # Flush any pending responses from the previous session
     await context.flush_pending_responses()

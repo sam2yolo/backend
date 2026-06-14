@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TUNNEL="$ROOT_DIR/scripts/tunnel"
+
+usage() {
+  cat <<'EOF'
+Expose notebook ports into an existing room.
+
+Usage:
+  scripts/quicktunnel [options] NAME PORT [PORT...]
+
+Required:
+  NAME                    Unique notebook name for this room
+  PORT                    One or more local ports to expose
+
+Room options:
+  --room-id ID            Room id (default: ROOM_ID)
+  --room-secret SECRET    Room secret (default: ROOM_SECRET)
+
+Broker options:
+  --broker URL            Broker URL (default: BROKER_URL or http://localhost:7001)
+  --api-token TOKEN       Broker API token (default: API_TOKEN or dev-token-change-me)
+  --json                  Print machine-readable JSON and do not start frpc
+
+Expose options:
+  --frps-host HOST        frps host (default: hostname from --broker)
+  --frps-port PORT        frps bind port (default: 7000)
+  --frps-token TOKEN      frps auth token (default: FRPS_TOKEN/FRP_AUTH_TOKEN)
+  --local-host HOST       Local service host (default: 127.0.0.1)
+  --config PATH           Write frpc config to PATH (default: temp file)
+  --no-start              Allocate tunnels and write config only
+  --cleanup               Delete created tunnels when frpc exits
+  --heartbeat-interval N  Heartbeat interval while frpc runs (default: 30)
+  --no-heartbeat          Do not heartbeat while frpc runs
+  -h, --help              Show help
+
+Examples:
+  scripts/quicktunnel notebook-a 8888
+  scripts/quicktunnel --room-id "$ROOM_ID" --room-secret "$ROOM_SECRET" notebook-a 8888 6006
+  scripts/quicktunnel --json notebook-a 8888
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+global_args=()
+expose_args=()
+name=""
+ports=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --broker|--api-token)
+      [[ -n "${2:-}" ]] || die "$1 requires a value"
+      global_args+=("$1" "$2")
+      shift 2
+      ;;
+    --json)
+      global_args+=("$1")
+      shift
+      ;;
+    --room-id|--room-secret|--frps-host|--frps-port|--frps-token|--local-host|--config|--heartbeat-interval)
+      [[ -n "${2:-}" ]] || die "$1 requires a value"
+      expose_args+=("$1" "$2")
+      shift 2
+      ;;
+    --no-start|--cleanup|--no-heartbeat)
+      expose_args+=("$1")
+      shift
+      ;;
+    --)
+      shift
+      if [[ -z "$name" && $# -gt 0 ]]; then
+        name="$1"
+        shift
+      fi
+      break
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      name="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+[[ -n "$name" ]] || die "NAME is required"
+
+if [[ $# -gt 0 ]]; then
+  ports+=("$@")
+fi
+[[ "${#ports[@]}" -gt 0 ]] || die "at least one PORT is required"
+
+for port in "${ports[@]}"; do
+  [[ "$port" =~ ^[0-9]+$ ]] || die "invalid port: $port"
+  (( port > 0 && port <= 65535 )) || die "port out of range: $port"
+done
+
+exec "$TUNNEL" "${global_args[@]}" expose "${expose_args[@]}" --name-prefix "$name" "${ports[@]}"
