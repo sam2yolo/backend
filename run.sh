@@ -23,7 +23,8 @@ ROOM_ID=$1
 ROOM_SECRET=$2
 NAME=$3
 
-
+mkdir /root/scripts
+cp tunnel /root/scripts
 
 tmux new -d -s s1 -n tunnel "./quicktunnel --broker $BROKER --room-id $ROOM_ID --room-secret $ROOM_SECRET --api-token $API_TOKEN --cleanup --frps-token $FRPS_TOKEN $NAME $APP_PORT"
 
@@ -86,5 +87,7 @@ fi
 
 echo "[INFO] Setup complete."
 
+
+export MPLBACKEND=Agg
 
 python app.py

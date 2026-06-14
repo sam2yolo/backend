@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+BROKER_URL="${BROKER_URL:-http://localhost:7001}"
+API_TOKEN="${API_TOKEN:-dev-token-change-me}"
+ROOM_ID="${ROOM_ID:-}"
+ROOM_SECRET="${ROOM_SECRET:-}"
+FRPS_HOST="${FRPS_HOST:-}"
+FRPS_PORT="${FRPS_PORT:-7000}"
+FRPS_TOKEN="${FRPS_TOKEN:-${FRP_AUTH_TOKEN:-frp-tunnel-broker-token}}"
+LOCAL_HOST="${LOCAL_HOST:-127.0.0.1}"
+NAME_PREFIX="${NAME_PREFIX:-notebook}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
+CONFIG_PATH=""
+JSON_MODE=0
+START_FRPC=1
+CLEANUP=0
+HEARTBEAT=1
+PORTS=()
+CREATED_JSON=()
+TUNNEL_IDS=()
+HEARTBEAT_PID=""
+
+
+
+
+usage() {
+  cat <<'EOF'
+frp-tunnel-broker helper for managers and notebooks.
+
+Usage:
+  scripts/tunnel [global options] COMMAND [command options]
+
+Global options:
+  --broker URL            Broker URL (default: BROKER_URL or http://localhost:7001)
+  --api-token TOKEN       Broker API token (default: API_TOKEN or dev-token-change-me)
+  --json                  Print machine-readable JSON
+  -h, --help              Show help
+
+Manager commands:
+  create-room [--name NAME]
+  list-rooms
+  get-room --room-id ID
+  delete-room --room-id ID
+
+Room/tunnel commands:
+  heartbeat --room-id ID
+  create-tunnel --room-id ID --room-secret SECRET [--name NAME]
+  list-tunnels --room-id ID
+  delete-tunnel --room-id ID --tunnel-id ID
+
+Notebook command:
+  expose --room-id ID --room-secret SECRET [options] PORT [PORT...]
+  quicktunnel [options] NAME PORT [PORT...]
+
+Expose options:
+  --frps-host HOST        frps host (default: hostname from --broker)
+  --frps-port PORT        frps bind port (default: 7000)
+  --frps-token TOKEN      frps auth token (default: FRPS_TOKEN/FRP_AUTH_TOKEN)
+  --local-host HOST       Local service host (default: 127.0.0.1)
+  --name-prefix PREFIX    Prefix for frpc proxy names (default: notebook)
+  --config PATH           Write frpc config to PATH (default: temp file)
+  --no-start              Allocate tunnels and write config only
+  --cleanup               Delete created tunnels when frpc exits
+  --heartbeat-interval N  Heartbeat interval while frpc runs (default: 30)
+  --no-heartbeat          Do not heartbeat while frpc runs
+
+Notes:
+  --json with expose implies --no-start so stdout remains valid JSON.
+
+Examples:
+  scripts/tunnel create-room --name team-a
+  scripts/tunnel list-rooms --json
+  scripts/tunnel heartbeat --room-id "$ROOM_ID"
+  scripts/tunnel expose --room-id "$ROOM_ID" --room-secret "$ROOM_SECRET" 8888 6006
+  scripts/tunnel --json expose --room-id "$ROOM_ID" --room-secret "$ROOM_SECRET" 8888
+  scripts/quicktunnel --room-id "$ROOM_ID" --room-secret "$ROOM_SECRET" notebook-a 8888 6006
+EOF
+}
+
+die() {
+  if [[ "$JSON_MODE" == "1" ]]; then
+    python3 - "$*" <<'PY'
+import json
+import sys
+
+print(json.dumps({"ok": False, "error": sys.argv[1]}))
+PY
+  else
+    echo "error: $*" >&2
+  fi
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found on PATH"
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+json_payload() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+it = iter(sys.argv[1:])
+print(json.dumps(dict(zip(it, it))))
+PY
+}
+
+broker_host() {
+  python3 - "$BROKER_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+print(urlparse(sys.argv[1]).hostname or "127.0.0.1")
+PY
+}
+
+pretty_json() {
+  python3 -m json.tool
+}
+
+print_response() {
+  local body="$1"
+  if [[ "$JSON_MODE" == "1" ]]; then
+    printf '%s\n' "$body"
+  else
+    printf '%s\n' "$body" | pretty_json
+  fi
+}
+
+api_call() {
+  local method="$1"
+  local path="$2"
+  local expected="$3"
+  local payload="${4:-}"
+  local tmp http_code body
+
+  tmp="$(mktemp)"
+  if [[ -n "$payload" ]]; then
+    http_code="$(
+      curl -sS -o "$tmp" -w "%{http_code}" \
+        -X "$method" "$BROKER_URL$path" \
+        -H "X-API-Token: $API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$payload"
+    )"
+  else
+    http_code="$(
+      curl -sS -o "$tmp" -w "%{http_code}" \
+        -X "$method" "$BROKER_URL$path" \
+        -H "X-API-Token: $API_TOKEN"
+    )"
+  fi
+  body="$(cat "$tmp")"
+  rm -f "$tmp"
+
+  if [[ "$http_code" != "$expected" ]]; then
+    if [[ "$JSON_MODE" == "1" ]]; then
+      python3 - "$http_code" "$body" <<'PY'
+import json
+import sys
+
+try:
+    body = json.loads(sys.argv[2])
+except Exception:
+    body = sys.argv[2]
+print(json.dumps({"ok": False, "status": int(sys.argv[1]), "body": body}))
+PY
+    else
+      echo "$body" >&2
+      echo "HTTP $http_code from $method $path" >&2
+    fi
+    exit 1
+  fi
+
+  printf '%s\n' "$body"
+}
+
+cleanup_tunnels() {
+  if [[ "$CLEANUP" != "1" || "${#TUNNEL_IDS[@]}" -eq 0 ]]; then
+    return
+  fi
+
+  [[ "$JSON_MODE" == "1" ]] || echo
+  [[ "$JSON_MODE" == "1" ]] || echo "Cleaning up created tunnels..."
+  for tunnel_id in "${TUNNEL_IDS[@]}"; do
+    curl -sS \
+      -X DELETE "$BROKER_URL/rooms/$ROOM_ID/tunnels/$tunnel_id" \
+      -H "X-API-Token: $API_TOKEN" >/dev/null || true
+  done
+}
+
+stop_heartbeat() {
+  if [[ -n "$HEARTBEAT_PID" ]]; then
+    kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    wait "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    HEARTBEAT_PID=""
+  fi
+}
+
+cleanup_runtime() {
+  stop_heartbeat
+  cleanup_tunnels
+}
+
+heartbeat_loop() {
+  local http_code tunnel_id path
+  while true; do
+    sleep "$HEARTBEAT_INTERVAL" || break
+    if [[ "${#TUNNEL_IDS[@]}" -eq 0 ]]; then
+      path="/rooms/$ROOM_ID/heartbeat"
+      http_code="$(
+        curl -sS -o /dev/null -w "%{http_code}" \
+          -X POST "$BROKER_URL$path" \
+          -H "X-API-Token: $API_TOKEN" || true
+      )"
+      if [[ "$http_code" != "200" ]]; then
+        echo "warning: heartbeat failed for room $ROOM_ID with HTTP $http_code" >&2
+      fi
+      continue
+    fi
+
+    for tunnel_id in "${TUNNEL_IDS[@]}"; do
+      path="/rooms/$ROOM_ID/tunnels/$tunnel_id/heartbeat"
+      http_code="$(
+        curl -sS -o /dev/null -w "%{http_code}" \
+          -X POST "$BROKER_URL$path" \
+          -H "X-API-Token: $API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(json_payload room_secret "$ROOM_SECRET")" || true
+      )"
+      if [[ "$http_code" != "200" ]]; then
+        echo "warning: heartbeat failed for tunnel $tunnel_id with HTTP $http_code" >&2
+      fi
+    done
+  done
+}
+
+parse_global() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --broker)
+        BROKER_URL="${2:-}"; shift 2 ;;
+      --api-token)
+        API_TOKEN="${2:-}"; shift 2 ;;
+      --json)
+        JSON_MODE=1; shift ;;
+      -h|--help)
+        usage; exit 0 ;;
+      -*)
+        die "unknown global option: $1" ;;
+      *)
+        COMMAND="$1"; shift; COMMAND_ARGS=("$@"); return ;;
+    esac
+  done
+  usage
+  exit 1
+}
+
+cmd_create_room() {
+  local name="" payload body
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      *) die "unknown create-room option: $1" ;;
+    esac
+  done
+  payload="$(json_payload name "$name")"
+  body="$(api_call POST /rooms 201 "$payload")"
+  if [[ "$JSON_MODE" == "1" ]]; then
+    print_response "$body"
+  else
+    python3 - "$body" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+print(f"room_id={data['room_id']}")
+print(f"room_secret={data['room_secret']}")
+print(f"status={data['status']}")
+PY
+  fi
+}
+
+cmd_list_rooms() {
+  [[ $# -eq 0 ]] || die "list-rooms does not accept arguments"
+  print_response "$(api_call GET /rooms 200)"
+}
+
+cmd_get_room() {
+  local room_id="$ROOM_ID"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      *) die "unknown get-room option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  print_response "$(api_call GET "/rooms/$room_id" 200)"
+}
+
+cmd_delete_room() {
+  local room_id="$ROOM_ID"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      *) die "unknown delete-room option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  print_response "$(api_call DELETE "/rooms/$room_id" 200)"
+}
+
+cmd_heartbeat() {
+  local room_id="$ROOM_ID"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      *) die "unknown heartbeat option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  print_response "$(api_call POST "/rooms/$room_id/heartbeat" 200)"
+}
+
+cmd_create_tunnel() {
+  local room_id="$ROOM_ID" secret="$ROOM_SECRET" name="" payload body
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      --room-secret) secret="${2:-}"; shift 2 ;;
+      --name) name="${2:-}"; shift 2 ;;
+      *) die "unknown create-tunnel option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  [[ -n "$secret" ]] || die "--room-secret is required"
+  payload="$(json_payload room_secret "$secret" name "$name")"
+  body="$(api_call POST "/rooms/$room_id/tunnels" 201 "$payload")"
+  print_response "$body"
+}
+
+cmd_list_tunnels() {
+  local room_id="$ROOM_ID"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      *) die "unknown list-tunnels option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  print_response "$(api_call GET "/rooms/$room_id/tunnels" 200)"
+}
+
+cmd_delete_tunnel() {
+  local room_id="$ROOM_ID" tunnel_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) room_id="${2:-}"; shift 2 ;;
+      --tunnel-id) tunnel_id="${2:-}"; shift 2 ;;
+      *) die "unknown delete-tunnel option: $1" ;;
+    esac
+  done
+  [[ -n "$room_id" ]] || die "--room-id is required"
+  [[ -n "$tunnel_id" ]] || die "--tunnel-id is required"
+  print_response "$(api_call DELETE "/rooms/$room_id/tunnels/$tunnel_id" 200)"
+}
+
+cmd_expose() {
+  local created body tunnel_id remote_port local_port
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --room-id) ROOM_ID="${2:-}"; shift 2 ;;
+      --room-secret) ROOM_SECRET="${2:-}"; shift 2 ;;
+      --frps-host) FRPS_HOST="${2:-}"; shift 2 ;;
+      --frps-port) FRPS_PORT="${2:-}"; shift 2 ;;
+      --frps-token) FRPS_TOKEN="${2:-}"; shift 2 ;;
+      --local-host) LOCAL_HOST="${2:-}"; shift 2 ;;
+      --name-prefix) NAME_PREFIX="${2:-}"; shift 2 ;;
+      --config) CONFIG_PATH="${2:-}"; shift 2 ;;
+      --no-start) START_FRPC=0; shift ;;
+      --cleanup) CLEANUP=1; shift ;;
+      --heartbeat-interval) HEARTBEAT_INTERVAL="${2:-}"; shift 2 ;;
+      --no-heartbeat) HEARTBEAT=0; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; PORTS+=("$@"); break ;;
+      -*) die "unknown expose option: $1" ;;
+      *) PORTS+=("$1"); shift ;;
+    esac
+  done
+
+  [[ -n "$ROOM_ID" ]] || die "--room-id is required"
+  [[ -n "$ROOM_SECRET" ]] || die "--room-secret is required"
+  [[ "${#PORTS[@]}" -gt 0 ]] || die "at least one local port is required"
+
+  for local_port in "${PORTS[@]}"; do
+    [[ "$local_port" =~ ^[0-9]+$ ]] || die "invalid port: $local_port"
+    (( local_port > 0 && local_port <= 65535 )) || die "port out of range: $local_port"
+  done
+  [[ "$HEARTBEAT_INTERVAL" =~ ^[0-9]+$ ]] || die "invalid heartbeat interval: $HEARTBEAT_INTERVAL"
+  (( HEARTBEAT_INTERVAL > 0 )) || die "heartbeat interval must be greater than 0"
+
+  if [[ -z "$FRPS_HOST" ]]; then
+    FRPS_HOST="$(broker_host)"
+  fi
+  if [[ -z "$CONFIG_PATH" ]]; then
+    CONFIG_PATH="$(mktemp -t frpc-notebook-XXXXXX.toml)"
+  fi
+  if [[ "$JSON_MODE" == "1" ]]; then
+    START_FRPC=0
+  fi
+
+  trap cleanup_runtime EXIT INT TERM
+
+  {
+    printf 'serverAddr = %s\n' "$(json_escape "$FRPS_HOST")"
+    printf 'serverPort = %s\n' "$FRPS_PORT"
+    printf 'auth.method = "token"\n'
+    printf 'auth.token = %s\n\n' "$(json_escape "$FRPS_TOKEN")"
+  } > "$CONFIG_PATH"
+
+  [[ "$JSON_MODE" == "1" ]] || echo "Creating tunnels via broker: $BROKER_URL"
+  [[ "$JSON_MODE" == "1" ]] || echo "Room: $ROOM_ID"
+  [[ "$JSON_MODE" == "1" ]] || echo
+
+  for local_port in "${PORTS[@]}"; do
+    body="$(api_call POST "/rooms/$ROOM_ID/tunnels" 201 "$(json_payload room_secret "$ROOM_SECRET" name "${NAME_PREFIX}-${local_port}")")"
+    tunnel_id="$(python3 - "$body" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])["tunnel_id"])
+PY
+)"
+    remote_port="$(python3 - "$body" <<'PY'
+import json, sys
+print(json.loads(sys.argv[1])["remote_port"])
+PY
+)"
+    TUNNEL_IDS+=("$tunnel_id")
+
+    {
+      printf '[[proxies]]\n'
+      printf 'name = %s\n' "$(json_escape "${NAME_PREFIX}-${local_port}-${remote_port}")"
+      printf 'type = "tcp"\n'
+      printf 'localIP = %s\n' "$(json_escape "$LOCAL_HOST")"
+      printf 'localPort = %s\n' "$local_port"
+      printf 'remotePort = %s\n\n' "$remote_port"
+    } >> "$CONFIG_PATH"
+
+    CREATED_JSON+=("$(python3 - "$local_port" "$remote_port" "$tunnel_id" <<'PY'
+import json, sys
+print(json.dumps({
+    "local_port": int(sys.argv[1]),
+    "remote_port": int(sys.argv[2]),
+    "tunnel_id": sys.argv[3],
+}))
+PY
+)")
+
+    [[ "$JSON_MODE" == "1" ]] || echo "local $LOCAL_HOST:$local_port -> $FRPS_HOST:$remote_port (tunnel $tunnel_id)"
+  done
+
+  if [[ "$JSON_MODE" == "1" ]]; then
+    python3 - "$BROKER_URL" "$ROOM_ID" "$FRPS_HOST" "$FRPS_PORT" "$LOCAL_HOST" "$CONFIG_PATH" "${CREATED_JSON[@]}" <<'PY'
+import json
+import sys
+
+broker, room_id, frps_host, frps_port, local_host, config_path, *items = sys.argv[1:]
+print(json.dumps({
+    "ok": True,
+    "broker_url": broker,
+    "room_id": room_id,
+    "frps_host": frps_host,
+    "frps_port": int(frps_port),
+    "local_host": local_host,
+    "config_path": config_path,
+    "mappings": [json.loads(x) for x in items],
+}))
+PY
+    return
+  fi
+
+  echo
+  echo "frpc config: $CONFIG_PATH"
+  if [[ "$START_FRPC" != "1" ]]; then
+    echo "Not starting frpc because --no-start was set."
+    return
+  fi
+
+  need_cmd frpc
+  echo
+  echo "Starting frpc. Press Ctrl+C to stop."
+  if [[ "$HEARTBEAT" == "1" ]]; then
+    echo "Heartbeat interval: ${HEARTBEAT_INTERVAL}s"
+    heartbeat_loop &
+    HEARTBEAT_PID="$!"
+  fi
+  frpc -c "$CONFIG_PATH"
+}
+
+need_cmd curl
+need_cmd python3
+
+COMMAND=""
+COMMAND_ARGS=()
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      JSON_MODE=1
+      shift
+      ;;
+    --broker)
+      BROKER_URL="${2:-}"
+      [[ -n "$BROKER_URL" ]] || die "--broker requires a value"
+      shift 2
+      ;;
+    --api-token)
+      API_TOKEN="${2:-}"
+      [[ -n "$API_TOKEN" ]] || die "--api-token requires a value"
+      shift 2
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+parse_global "${ARGS[@]}"
+
+case "$COMMAND" in
+  create-room) cmd_create_room "${COMMAND_ARGS[@]}" ;;
+  list-rooms) cmd_list_rooms "${COMMAND_ARGS[@]}" ;;
+  get-room) cmd_get_room "${COMMAND_ARGS[@]}" ;;
+  delete-room) cmd_delete_room "${COMMAND_ARGS[@]}" ;;
+  heartbeat) cmd_heartbeat "${COMMAND_ARGS[@]}" ;;
+  create-tunnel) cmd_create_tunnel "${COMMAND_ARGS[@]}" ;;
+  list-tunnels) cmd_list_tunnels "${COMMAND_ARGS[@]}" ;;
+  delete-tunnel) cmd_delete_tunnel "${COMMAND_ARGS[@]}" ;;
+  expose) cmd_expose "${COMMAND_ARGS[@]}" ;;
+  help) usage ;;
+  *) die "unknown command: $COMMAND" ;;
+esac
