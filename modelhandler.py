@@ -311,17 +311,12 @@ class yoloHandler(ModelHandler):
             return
 
         save_dir = payload.get("save_dir", f"results/{task_id}")
-        images_dir = os.path.join(save_dir, "images")
-        masks_dir = os.path.join(save_dir, "masks")
         os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(images_dir, exist_ok=True)
-        os.makedirs(masks_dir, exist_ok=True)
-
 
         if file_type == "video":
             self._infer_video(payload, context, save_dir)
         elif file_type == "image":
-            self._infer_image(payload, context, save_dir, images_dir, masks_dir)
+            self._infer_image(payload, context, save_dir)
         else:
             send_action(context, "inference_task_error", {
                 "id": task_id, "error": f"UNSUPPORTED_FILE_TYPE: {file_type}"
@@ -339,8 +334,6 @@ class yoloHandler(ModelHandler):
         frames_param = payload.get("frames", None)
         imgsz = payload.get('imgsz',None)
         classes = payload.get('classes',None)
-        persist = payload.get('persist',None)
-        tracker = payload.get('tracker',None)
 
         # get file path from file id
         file_info = context.get_file_path_from_id(file_id)
@@ -512,66 +505,87 @@ class yoloHandler(ModelHandler):
     # ------------------------------------------------------------------
     #  Image inference
     # ------------------------------------------------------------------
-    def _infer_image(self, payload, context, save_dir, images_dir, masks_dir):
+    def _infer_image(self, payload, context, save_dir):
         task_id = payload.get("id")
-        file_id = payload.get("file_id")
+        file_ids = payload.get("file_ids", [])
         conf = payload.get("conf", 0.25)
         iou = payload.get("iou", 0.45)
+        imgsz = payload.get('imgsz', None)
+        classes = payload.get('classes', None)
 
-        file_info = context.get_file_path_from_id(file_id)
-        if not file_info:
-            send_action(context, "inference_task_error", {"id": task_id, 'error': 'FILE_PATH_NOT_FOUND'})
+        if not file_ids:
+            send_action(context, "inference_task_error", {"id": task_id, 'error': 'NO_FILE_IDS_PROVIDED'})
             return
-        file_path = file_info["path"] if isinstance(file_info, dict) else file_info
 
-        # Prepare training-ready dataset directories
-        dataset_dir = os.path.join(save_dir, "dataset")
-        out_images_dir = os.path.join(dataset_dir, "images")
-        out_masks_dir = os.path.join(dataset_dir, "masks")
-        os.makedirs(out_images_dir, exist_ok=True)
-        os.makedirs(out_masks_dir, exist_ok=True)
+        # Resolve all file paths
+        file_paths = []
+        for fid in file_ids:
+            file_info = context.get_file_path_from_id(fid)
+            if not file_info:
+                send_action(context, "inference_task_error", {"id": task_id, 'error': f'FILE_PATH_NOT_FOUND for {fid}'})
+                return
+            file_path = file_info["path"] if isinstance(file_info, dict) else file_info
+            file_paths.append(file_path)
 
-        result = self.model.predict(
-            file_path,
-            conf=conf,
-            iou=iou,
-            imgsz=payload.get('image_size', 640),
-            save=True,
-            project=save_dir,
-            name='.',
-            exist_ok=True
-        )
+        total = len(file_paths)
+        processed_count = 0
+        chunk_index = 0
 
-        all_annotations = []
-        for frame_idx, r in enumerate(result):
+        # Track chunks in context for later retrieval
+        if task_id not in context.inference_results:
+            context.inference_results[task_id] = {}
+
+        # Process in batches (same logic as video)
+        batch_size = payload.get('batch', 128)
+        file_batches = self._chunk_frames(file_paths, batch_size)
+
+        for batch_paths in file_batches:
             if context.stop_event.is_set():
                 send_action(context, "task_cancelled", {"id": task_id})
                 return
 
-            # Save original image copy to dataset/images/
-            orig_img = r.orig_img
-            frame_key = f"frame_{frame_idx:06d}"
-            img_filename = f"{frame_key}.jpg"
-            img_path = os.path.join(out_images_dir, img_filename)
-            if orig_img is not None:
-                cv2.imwrite(img_path, cv2.cvtColor(orig_img, cv2.COLOR_RGB2BGR))
-            else:
-                # Fall back: copy source file
-                import shutil
-                if os.path.isfile(file_path):
-                    shutil.copy2(file_path, img_path)
+            # --- Run inference on this batch of images ---
+            predict_kwargs = dict(conf=conf, iou=iou, verbose=True, classes=classes)
+            if imgsz is not None:
+                predict_kwargs['imgsz'] = imgsz
 
-            annotation = self._extract_frame_annotation(
-                r, frame_idx, out_images_dir, out_masks_dir, save_dir
-            )
-            if annotation:
-                all_annotations.append(annotation)
+            batch_results = self.model.predict(batch_paths, **predict_kwargs)
 
-        self._save_annotations_json(all_annotations, save_dir, task_id, context)
+            processed_count += len(batch_paths)
+            progress = int((processed_count / total) * 100)
+            send_action(context, "inference_stage_plus_progress", {
+                "task_id": task_id,
+                "progress": progress,
+                "stage": f"Processing image {processed_count}/{total}"
+            })
+
+            # --- Save batch result as pickle and register chunk ---
+            chunk_id = str(uuid.uuid4())[:8]
+            save_file = os.path.join(save_dir, f'chunk-{chunk_index}.pkl')
+            with open(save_file, 'wb') as f:
+                pickle.dump(batch_results, f)
+
+            context.inference_results[chunk_id] = {
+                'task_id': task_id,
+                'chunk_index': chunk_index,
+                'save_file': save_file,
+                'frame_count': len(batch_results),
+                'frames': list(range(processed_count - len(batch_paths), processed_count))
+            }
+
+            send_action(context, 'inference_task_chunk_result', {
+                'chunk_id': chunk_id,
+                'chunk_index': chunk_index,
+                'task_id': task_id,
+                'frame_count': len(batch_results)
+            })
+
+            chunk_index += 1
+
         send_action(context, "inference_completed", {
             "task_id": task_id,
-            "result": save_dir,
-            "result_count": len(all_annotations)
+            "save_dir": save_dir,
+            "result_count": processed_count
         })
 
     # ------------------------------------------------------------------
@@ -691,76 +705,7 @@ class yoloHandler(ModelHandler):
         Override this method with your own embedding extraction."""
         return None
 
-    # ------------------------------------------------------------------
-    #  Save master annotations JSON (COCO-inspired)
-    # ------------------------------------------------------------------
-    def _save_annotations_json(self, annotations, save_dir, task_id, context):
-        cat_set = set()
-        ann_id = 0
-        tracking_entries = []
-        coco_output = {
-            "info": {
-                "task_id": task_id,
-                "description": "Auto-generated annotations from YOLO inference",
-                "version": "1.0"
-            },
-            "images": [], "annotations": [], "categories": [], "tracking": []
-        }
 
-        for frame_ann in annotations:
-            if frame_ann is None:
-                continue
-            coco_output["images"].append({
-                "id": frame_ann["image_id"],
-                "file_name": frame_ann["image_file"],
-                "path": frame_ann["image_path"],
-                "width": frame_ann["width"],
-                "height": frame_ann["height"]
-            })
-            for det in frame_ann.get("annotations", []):
-                coco_output["annotations"].append({
-                    "id": ann_id,
-                    "image_id": det["image_id"],
-                    "category_id": det["category_id"],
-                    "category_name": det["category_name"],
-                    "bbox": det["bbox"],
-                    "area": det["area"],
-                    "segmentation": det["segmentation"],
-                    "mask_path": det["mask_path"],
-                    "confidence": det["confidence"],
-                    "iscrowd": 0
-                })
-                cat_set.add((det["category_id"], det["category_name"]))
-                if det["track_id"] is not None:
-                    tracking_entries.append({
-                        "image_id": det["image_id"],
-                        "annotation_id": ann_id,
-                        "track_id": det["track_id"],
-                        "category_id": det["category_id"],
-                        "bbox": det["bbox"]
-                    })
-                ann_id += 1
-
-        for cid, cname in sorted(cat_set):
-            coco_output["categories"].append({"id": cid, "name": cname, "supercategory": "object"})
-        if tracking_entries:
-            coco_output["tracking"] = tracking_entries
-
-        ann_path = os.path.join(save_dir, "annotations.json")
-        with open(ann_path, "w") as f:
-            json.dump(coco_output, f, indent=2)
-
-        summary_path = os.path.join(save_dir, "dataset_summary.json")
-        with open(summary_path, "w") as f:
-            json.dump({
-                "task_id": task_id,
-                "num_images": len(coco_output["images"]),
-                "num_annotations": len(coco_output["annotations"]),
-                "num_categories": len(coco_output["categories"]),
-                "has_tracking": len(tracking_entries) > 0,
-                "images_dir": os.path.join(save_dir, "images"),
-                "masks_dir": os.path.join(save_dir, "masks")
-            }, f, indent=2)
 
     # ------------------------------------------------------------------
     #  Utilities

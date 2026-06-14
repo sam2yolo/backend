@@ -4,6 +4,19 @@
 
 apt install tmux
 
+APP_PORT=8000
+
+# initiate frpc
+
+## create room
+
+
+
+create_room
+
+
+# run
+tmux new -d -s s1 -n frpc "frpc -c frpc.toml"
 
 
 set -euo pipefail
