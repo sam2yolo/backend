@@ -218,35 +218,18 @@ cleanup_runtime() {
 }
 
 heartbeat_loop() {
-  local http_code tunnel_id path
+  local http_code path
   while true; do
     sleep "$HEARTBEAT_INTERVAL" || break
-    if [[ "${#TUNNEL_IDS[@]}" -eq 0 ]]; then
-      path="/rooms/$ROOM_ID/heartbeat"
-      http_code="$(
-        curl -sS -o /dev/null -w "%{http_code}" \
-          -X POST "$BROKER_URL$path" \
-          -H "X-API-Token: $API_TOKEN" || true
-      )"
-      if [[ "$http_code" != "200" ]]; then
-        echo "warning: heartbeat failed for room $ROOM_ID with HTTP $http_code" >&2
-      fi
-      continue
+    path="/rooms/$ROOM_ID/heartbeat"
+    http_code="$(
+      curl -sS -o /dev/null -w "%{http_code}" \
+        -X POST "$BROKER_URL$path" \
+        -H "X-API-Token: $API_TOKEN" || true
+    )"
+    if [[ "$http_code" != "200" ]]; then
+      echo "warning: heartbeat failed for room $ROOM_ID with HTTP $http_code" >&2
     fi
-
-    for tunnel_id in "${TUNNEL_IDS[@]}"; do
-      path="/rooms/$ROOM_ID/tunnels/$tunnel_id/heartbeat"
-      http_code="$(
-        curl -sS -o /dev/null -w "%{http_code}" \
-          -X POST "$BROKER_URL$path" \
-          -H "X-API-Token: $API_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d "$(json_payload room_secret "$ROOM_SECRET")" || true
-      )"
-      if [[ "$http_code" != "200" ]]; then
-        echo "warning: heartbeat failed for tunnel $tunnel_id with HTTP $http_code" >&2
-      fi
-    done
   done
 }
 

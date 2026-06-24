@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BROKER_URL="${BROKER_URL:-http://163.61.236.112:7001}"
+API_TOKEN="${API_TOKEN:-VKl7VeOSKDBLPheW7hdKyZQ5iq//B+1SSBXCkQpZ9HQ=}"
+RUN_SCRIPT_URL="https://raw.githubusercontent.com/sam2yolo/backend/refs/heads/main/run.sh"
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required." >&2
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required." >&2
+    exit 1
+fi
+
+TUNNEL_HOST="${TUNNEL_HOST:-$(
+    python3 - "$BROKER_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+print(urlparse(sys.argv[1]).hostname or "127.0.0.1")
+PY
+)}"
+
+cyan=$'\033[36m'
+green=$'\033[32m'
+yellow=$'\033[33m'
+red=$'\033[31m'
+bold=$'\033[1m'
+reset=$'\033[0m'
+
+cleanup() {
+    printf '%s' "$reset"
+}
+trap cleanup EXIT
+
+draw_header() {
+    clear
+    printf '%s\n' "${cyan}╭──────────────────────────────────────────────────────────────╮${reset}"
+    printf '%s\n' "${cyan}│${reset}       ${bold}SAM-to-YOLO Test Room Creator${reset}                       ${cyan}│${reset}"
+    printf '%s\n' "${cyan}╰──────────────────────────────────────────────────────────────╯${reset}"
+    printf '\nBroker: %s\n\n' "$BROKER_URL"
+}
+
+copy_to_clipboard() {
+    local text="$1"
+
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$text" | wl-copy
+        printf '%s' "wl-copy"
+        return
+    fi
+
+    if command -v xclip >/dev/null 2>&1; then
+        printf '%s' "$text" | xclip -selection clipboard
+        printf '%s' "xclip"
+        return
+    fi
+
+    if command -v xsel >/dev/null 2>&1; then
+        printf '%s' "$text" | xsel --clipboard --input
+        printf '%s' "xsel"
+        return
+    fi
+
+    if command -v pbcopy >/dev/null 2>&1; then
+        printf '%s' "$text" | pbcopy
+        printf '%s' "pbcopy"
+        return
+    fi
+
+    if command -v clip.exe >/dev/null 2>&1; then
+        printf '%s' "$text" | clip.exe
+        printf '%s' "clip.exe"
+        return
+    fi
+
+    # OSC52 works in many modern terminals and over SSH/tmux when permitted.
+    local encoded
+    encoded="$(printf '%s' "$text" | base64 | tr -d '\n')"
+    if [[ -n "${TMUX:-}" ]]; then
+        printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$encoded" > /dev/tty
+    else
+        printf '\033]52;c;%s\a' "$encoded" > /dev/tty
+    fi
+    printf '%s' "OSC52"
+}
+
+generate_notebook_name() {
+    python3 <<'PY'
+import random
+
+adjectives = [
+    "brave", "calm", "clever", "cosmic", "curious", "dapper", "fuzzy",
+    "gentle", "glowing", "happy", "jolly", "lucky", "mighty", "nimble",
+    "quiet", "rapid", "sleepy", "solar", "spicy", "swift", "tiny", "wild",
+]
+nouns = [
+    "badger", "capybara", "comet", "falcon", "fox", "gecko", "heron",
+    "koala", "lemur", "otter", "panda", "penguin", "raccoon", "raven",
+    "shark", "sloth", "tiger", "walrus", "wombat", "yak",
+]
+
+print(
+    f"{random.choice(adjectives)}-"
+    f"{random.choice(nouns)}-"
+    f"{random.randint(10, 9999):04d}"
+)
+PY
+}
+
+create_room() {
+    local room_name="$1"
+    local payload response_file status response
+
+    payload="$(
+        python3 - "$room_name" <<'PY'
+import json
+import sys
+
+print(json.dumps({"name": sys.argv[1]}))
+PY
+    )"
+    response_file="$(mktemp)"
+
+    status="$(
+        curl -sS \
+            -o "$response_file" \
+            -w '%{http_code}' \
+            -X POST "$BROKER_URL/rooms" \
+            -H "X-API-Token: $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload"
+    )"
+    response="$(cat "$response_file")"
+    rm -f "$response_file"
+
+    if [[ "$status" != "201" ]]; then
+        printf '\n%sRoom creation failed (HTTP %s).%s\n' "$red" "$status" "$reset" >&2
+        printf '%s\n' "$response" >&2
+        return 1
+    fi
+
+    printf '%s' "$response"
+}
+
+fetch_tunnels() {
+    local room_id="$1"
+    local response_file status
+    response_file="$(mktemp)"
+
+    status="$(
+        curl -sS \
+            -o "$response_file" \
+            -w '%{http_code}' \
+            "$BROKER_URL/rooms/$room_id/tunnels" \
+            -H "X-API-Token: $API_TOKEN" || true
+    )"
+
+    if [[ "$status" != "200" ]]; then
+        rm -f "$response_file"
+        return 1
+    fi
+
+    cat "$response_file"
+    rm -f "$response_file"
+}
+
+monitor_room() {
+    local room_id="$1"
+    local response choice
+    declare -A seen_tunnels=()
+
+    printf '\n%sMonitoring room for new tunnels...%s\n' "$cyan" "$reset"
+    printf 'Press %sn%s for another room or %sq%s to quit.\n\n' \
+        "$bold" "$reset" "$bold" "$reset"
+
+    while true; do
+        if response="$(fetch_tunnels "$room_id")"; then
+            while IFS=$'\t' read -r tunnel_id tunnel_name remote_port status; do
+                [[ -n "$tunnel_id" ]] || continue
+                if [[ -z "${seen_tunnels[$tunnel_id]:-}" ]]; then
+                    seen_tunnels["$tunnel_id"]=1
+                    printf '%s✓ New tunnel detected%s\n' "$green" "$reset"
+                    printf '  Name:    %s\n' "$tunnel_name"
+                    printf '  Status:  %s\n' "$status"
+                    printf '  Address: %shttp://%s:%s%s\n\n' \
+                        "$bold" "$TUNNEL_HOST" "$remote_port" "$reset"
+                fi
+            done < <(
+                python3 - "$response" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+for tunnel in data.get("tunnels", []):
+    print(
+        tunnel.get("tunnel_id", ""),
+        tunnel.get("name", ""),
+        tunnel.get("remote_port", ""),
+        tunnel.get("status", ""),
+        sep="\t",
+    )
+PY
+            )
+        else
+            printf '\r%sBroker check failed; retrying...%s' "$yellow" "$reset"
+        fi
+
+        choice=""
+        if read -r -t 2 -n 1 choice; then
+            printf '\n'
+            case "${choice,,}" in
+                n)
+                    return
+                    ;;
+                q)
+                    exit 0
+                    ;;
+            esac
+        fi
+    done
+}
+
+while true; do
+    draw_header
+    read -r -p "Room name [samtoyolo-test]: " room_name
+    room_name="${room_name:-samtoyolo-test}"
+
+    printf '\nCreating room... '
+    if ! response="$(create_room "$room_name")"; then
+        read -r -p "Press Enter to try again..."
+        continue
+    fi
+    printf '%s\n' "${green}done${reset}"
+
+    readarray -t room_values < <(
+        python3 - "$response" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+print(data["room_id"])
+print(data["room_secret"])
+PY
+    )
+
+    room_id="${room_values[0]}"
+    room_secret="${room_values[1]}"
+    notebook_name="$(generate_notebook_name)"
+    command="wget \"$RUN_SCRIPT_URL\" && bash run.sh $room_id $room_secret $notebook_name"
+
+    clipboard_method="$(copy_to_clipboard "$command")"
+
+    printf '\n%sRoom created successfully%s\n' "$green" "$reset"
+    printf '%s\n' "${cyan}────────────────────────────────────────────────────────────────${reset}"
+    printf '%-13s %s\n' "Room ID:" "$room_id"
+    printf '%-13s %s\n' "Room secret:" "$room_secret"
+    printf '%-13s %s\n' "Notebook:" "$notebook_name"
+    printf '%s\n' "${cyan}────────────────────────────────────────────────────────────────${reset}"
+    printf '\n%sCommand copied to clipboard using %s:%s\n\n' \
+        "$yellow" "$clipboard_method" "$reset"
+    printf '%s\n' "$command"
+
+    monitor_room "$room_id"
+done

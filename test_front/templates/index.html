@@ -76,7 +76,8 @@
                             <span class="arrow text-gray-600">▶</span> Model
                         </div>
                         <div class="group-content pl-3 space-y-0.5">
-                            <button onclick="tmpl('init_model',{model_name:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-emerald-400 mr-1">◆</span>Init Model</button>
+                            <button onclick="tmpl('init_model',{model_name:'yolo',variant_name:'yolo11n'})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-emerald-400 mr-1">◆</span>Init YOLO</button>
+                            <button onclick="tmpl('init_model',{model_name:'sam',base_url:'http://127.0.0.1:8001'})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-emerald-400 mr-1">◆</span>Init SAM</button>
                             <button onclick="tmpl('destroy_model',{model_name:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-red-400 mr-1">◆</span>Destroy Model</button>
                         </div>
                     </div>
@@ -95,7 +96,8 @@
                             <span class="arrow text-gray-600">▶</span> Inference
                         </div>
                         <div class="group-content pl-3 space-y-0.5">
-                            <button onclick="tmpl('create_inference_task',{model_name:'',file_id:'',file_type:'image',batch_size:4,conf:0.25,iou:0.45})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Create Task</button>
+                            <button onclick="tmpl('create_inference_task',{file_id:'',file_ids:[],file_type:'image',batch:4,conf:0.25,iou:0.45})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>YOLO Image Task</button>
+                            <button onclick="tmpl('create_inference_task',{file_ids:[],file_type:'image',text_prompt:'person',batch:2,conf:0.5})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>SAM Image Task</button>
                             <button onclick="tmpl('delete_inference_task',{task_id:''})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Delete Task</button>
                             <button onclick="tmpl('start_inference_from_queue',{})" class="w-full text-left px-2 py-0.5 rounded hover:bg-gray-800 text-gray-300 hover:text-cyan-400 transition text-[11px]"><span class="text-rose-400 mr-1">▶</span>Start Queue</button>
                         </div>

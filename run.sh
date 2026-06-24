@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
+if [[ -z "${1:-}" || -z "${2:-}" ]]; then
+    echo "Usage: $0 <room_id> <room_secret> [name]" >&2
+    echo "[ERROR] room_id and room_secret are required." >&2
+    exit 1
+fi
+
+ROOM_ID="$1"
+ROOM_SECRET="$2"
+NAME="${3:-samtoyolo-backend}"
+
 apt update
 
 # install utilities
@@ -19,16 +31,11 @@ chmod +x /bin
 BROKER=http://163.61.236.112:7001                                            
 API_TOKEN='VKl7VeOSKDBLPheW7hdKyZQ5iq//B+1SSBXCkQpZ9HQ='                   
 FRPS_TOKEN='kEfip7iduT8PpQ4PDsT1QCEtB0wI+nSENhcUjh7oBUM='
-ROOM_ID=$1
-ROOM_SECRET=$2
-NAME=$3
 
 mkdir /root/scripts
 cp tunnel /root/scripts
 
 tmux new -d -s s1 -n tunnel "./quicktunnel --broker $BROKER --room-id $ROOM_ID --room-secret $ROOM_SECRET --api-token $API_TOKEN --cleanup --frps-token $FRPS_TOKEN $NAME $APP_PORT"
-
-set -euo pipefail
 
 ENV_NAME="samtoyolo_conda_environment"
 MINICONDA_DIR="$HOME/miniconda3"
@@ -89,5 +96,7 @@ echo "[INFO] Setup complete."
 
 
 export MPLBACKEND=Agg
+
+echo $PWD
 
 python app.py

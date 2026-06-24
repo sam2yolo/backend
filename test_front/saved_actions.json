@@ -54,5 +54,26 @@
       "device": "cuda"
     },
     "label": "yolo_inference_cuda"
+  },
+  {
+    "id": "6",
+    "action": "init_model",
+    "payload": {
+      "model_name": "sam",
+      "base_url": "http://127.0.0.1:8001"
+    },
+    "label": "Init SAM3"
+  },
+  {
+    "id": "7",
+    "action": "create_inference_task",
+    "payload": {
+      "file_ids": [],
+      "file_type": "image",
+      "text_prompt": "person",
+      "batch": 2,
+      "conf": 0.5
+    },
+    "label": "Create SAM Image Task"
   }
 ]

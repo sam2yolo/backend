@@ -129,10 +129,9 @@ async def handle_init_model(websocket: WebSocket, data: dict, context: Context):
             logging.error("ModelHandler not found")
             return
 
-        if model_name == 'yolo':
-            context.modelHandler = ModelHandlerClass(context, data)
-            context.modelHandler.setup(data,context)
-            context.modelHandler.init(data, context)
+        context.modelHandler = ModelHandlerClass(context, data)
+        context.modelHandler.setup(data, context)
+        context.modelHandler.init(data, context)
 
     thread = threading.Thread(target=worker, args=(data,context))
     thread.daemon = True

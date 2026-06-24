@@ -189,6 +189,8 @@ class Context:
         # lazy import to avoid circular dependency
         from modelhandler import yoloHandler
         self.models_dict['yolo'] = yoloHandler
+        from modelhandler import samHandler
+        self.models_dict['sam'] = samHandler
 
     def get_file_path_from_id(self, id):
         return self.files_dict.get(id, None)

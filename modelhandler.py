@@ -127,6 +127,8 @@ class ModelHandler:
         pass
 
 
+
+
 class yoloHandler(ModelHandler):
     def __init__(self, context, payload):
         super().__init__(context)
@@ -135,7 +137,7 @@ class yoloHandler(ModelHandler):
 
     def setup(self, payload, context):
         send_action(context, 'model_setup_started', {'model_name': self.model_name})
-        subprocess.call(['pip', 'install', '-y', 'ultralytics'], shell=False)
+        subprocess.call(['pip', 'install', 'ultralytics'], shell=False)
         send_action(context, 'model_setup_completed', {'model_name': self.model_name})
 
     def init(self, payload, context):
@@ -750,3 +752,723 @@ class yoloHandler(ModelHandler):
 
 
 
+class samHandler(ModelHandler):
+    def __init__(self, context,payload):
+        self.port=8001
+
+    def setup(self,payload,context):
+        # setup environment
+
+        send_action(context, 'model_setup_started', {'model_name': self.model_name})
+        subprocess.call('bash sam/sam_env.sh'.split(' '), shell=False)
+        send_action(context, 'model_setup_completed', {'model_name': self.model_name})
+    def init(self,payload,context):
+        self.model_name = 'sam3.1'
+        logging.debug(f'initiating model {self.model_name}')
+        send_action(context, 'model_init_started', {'model_name': self.model_name})
+        def sam_start():
+            subprocess.call('python sam_fastapi_server.py'.split(' '),shell=False)
+        threading.Thread(sam_start, args=())
+        send_action(context, 'model_init_completed', {'model_name': self.model_name})
+
+    def destroy(self, payload, context):
+        subprocess.call('bash sam_destroy.sh'.split(),shell=False)
+        send_action(context, 'model_destroyed', {'model_name': self.model_name})
+
+
+    def add_task(self, payload, context):
+        payload["id"] = str(uuid.uuid4())[:16]
+
+        '''
+        parameters for payload:
+
+        file_id*
+        file_type*
+        frames
+        conf
+        iou
+        classes
+        imgsz
+        persist
+        tracker
+        '''
+
+        file_id = payload.get("file_id",None)
+        file_type = payload.get("file_type",None)
+
+        # check if file id is sent
+        if not file_id:
+            # file_id is required send error
+            send_action(context, "create_inference_task_error", {"error": "no_file_id_provided"})
+            return
+
+        # check if file type is sent
+        if not file_type:
+            # file_id is required send error
+            send_action(context, "create_inference_task_error", {"error": "no_file_id_provided"})
+            return
+
+
+        # check if file exists
+        if not file_id in context.files_dict:
+            # file in not found
+            send_action(context, "create_infrerence_task_error", {"error": "file_not_found"})
+            return
+        
+        # check if file type is valid
+
+        if not (file_type == 'video' or file_type == 'image'):
+            # file type is not valid for inference
+            # send error
+            send_action(context,'create_inference_task_error',{"error":"file_type_not_valid_error"})
+
+        # all ok for now add the task in queue
+
+        self.tasks.append(payload)
+        send_action(context, "task_added", payload)    
+
+    
+    def delete_task(self, data, context):
+        task_id = data.get("id")
+        if not task_id:
+            send_action(context, "task_delete_error", {"error": "No task id provided"})
+            return
+        if self.current_task and self.current_task.get("id") == task_id:
+            self.cancelled_tasks.add(task_id)
+            self.running = False
+            send_action(context, "task_cancelled", {"id": task_id})
+            return
+        for i, task in enumerate(self.tasks):
+            if task.get("id") == task_id:
+                self.tasks.pop(i)
+                send_action(context, "task_deleted", {"id": task_id})
+                return
+        send_action(context, "task_not_found", {"id": task_id})
+
+    def start_working(self, payload, context):
+        if self.running:
+            send_action(context, "already_working", {"message": "Already processing tasks"})
+            return
+        if not self.tasks:
+            send_action(context, "queue_empty", {"message": "No tasks in queue"})
+            return
+        self.running = True
+        thread = threading.Thread(target=self._process_queue, args=(context,))
+        thread.daemon = True
+        thread.start()
+        send_action(context, "work_started", {"message": "Started processing task queue"})
+
+    def handle_train_task(self, payload, context):        
+        send_action(context, "not_supported", {'message':'Train task not yet supported for sam 3.1'})
+
+    def handle_inference_task(self, payload, context):
+
+        '''
+        parameters for payload:
+
+        file_id*
+        file_type*
+        frames
+        conf
+        iou
+        classes
+        imgsz
+        persist
+        tracker
+        '''
+              
+        task_id = payload.get("id")
+        file_type = payload.get("file_type", None)
+        conf = payload.get("conf", 0.25)
+        iou = payload.get("iou", 0.45)
+        file_id = payload.get('file_id',None)
+
+        if not file_type:
+            send_action(context, "inference_task_error", {"id": task_id, 'error': 'FILE_TYPE_NOT_FOUND'})
+            return
+        if not file_id:
+            send_action(context, "inference_task_error", {"id": task_id, 'error': 'FILE_ID_NOT_FOUND'})
+            return
+
+        save_dir = payload.get("save_dir", f"results/{task_id}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        if file_type == "video":
+            self._infer_video(payload, context, save_dir)
+        elif file_type == "image":
+            self._infer_image(payload, context, save_dir)
+        else:
+            send_action(context, "inference_task_error", {
+                "id": task_id, "error": f"UNSUPPORTED_FILE_TYPE: {file_type}"
+            })
+
+    # ------------------------------------------------------------------
+    #  Video inference
+    # ------------------------------------------------------------------
+    def _infer_video(self, payload, context, save_dir):
+        # parse all parameters
+        task_id = payload.get("id")
+        file_id = payload.get("file_id")
+        conf = payload.get("conf", 0.25)
+        iou = payload.get("iou", 0.45)
+        frames_param = payload.get("frames", None)
+        imgsz = payload.get('imgsz',None)
+        classes = payload.get('classes',None)
+
+        # get file path from file id
+        file_info = context.get_file_path_from_id(file_id)
+        if not file_info:
+            send_action(context, "inference_task_error", {"id": task_id, 'error': 'FILE_PATH_NOT_FOUND'})
+            return
+        file_path = file_info["path"] if isinstance(file_info, dict) else file_info
+
+        logging.info(f'file_path: {file_path}')
+
+        # Prepare output directories for training-ready dataset format
+        dataset_dir = os.path.join(save_dir, "dataset")
+        images_dir = os.path.join(dataset_dir, "images")
+        masks_dir = os.path.join(dataset_dir, "masks")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(masks_dir, exist_ok=True)
+
+        # Determine which frames to process
+        if frames_param is not None:
+            frame_indices = frames_param
+            total = len(frame_indices)
+            send_action(context, "inference_stage_plus_progress", {
+                "task_id": task_id, "progress": 0,
+                "stage": f"Processing {total} specific frames from video"
+            })
+        else:
+            # Get total frame count first
+            try:
+                total_frames = self._get_frame_count(file_path)
+                if total_frames is None:
+                    raise ValueError("Could not count frames")
+                frame_indices = list(range(total_frames))
+                total = total_frames
+            except Exception as e:
+                send_action(context, "inference_task_error", {
+                    "id": task_id, 'error': 'frame_count_failed', 'trace': str(e)
+                })
+                return
+
+        # Temporal downsampling
+        temporal_downsampling = payload.get('temporal_downsampling', None)
+        if temporal_downsampling:
+            drop_rate = payload.get('drop_rate', 0.01)
+            if drop_rate > 1:
+                drop_rate = 1
+                send_action(context, "inference_task_warning", {
+                    "task_id": task_id, "warning": "Drop rate is > 1. Setting to 1"
+                })
+            frame_indices = self._drop_items_evenly(frame_indices, drop_rate)
+
+        # Chunk frame indices into batches — only `batch` frames in memory at once
+        batch_size = payload.get('batch', 128)
+        frame_batches = self._chunk_frames(frame_indices, batch_size)
+        total_frames_to_process = len(frame_indices)
+        processed_count = 0
+        all_annotations = []
+        chunk_index = 0
+
+        # Track chunks in context for later retrieval
+        if task_id not in context.inference_results:
+            context.inference_results[task_id] = {}
+
+        for batch_indices in frame_batches:
+            if context.stop_event.is_set():
+                send_action(context, "task_cancelled", {"id": task_id})
+                logging.info('Task cancelled')
+                return
+
+            # --- Extract batch frames from video (memory-bound) ---
+            logging.debug(f'{task_id}: Extracing frames for batch {chunk_index}')
+            batch_frames = self._extract_frames_from_video(file_path, batch_indices)
+            if not batch_frames:
+                continue
+
+            # --- Run inference on this batch ---
+            logging.debug(f'{task_id}: Running inference for batch {chunk_index}')
+            
+            predict_kwargs = dict(conf=conf, iou=iou,verbose=True, classes=classes)
+            if imgsz is not None:
+                predict_kwargs['imgsz'] = imgsz
+            # Separate frame indices and arrays — YOLO only accepts arrays
+            
+            batch_frame_indices = [idx for idx, _ in batch_frames]
+            batch_frame_arrays = [arr for _, arr in batch_frames]
+
+            # inference
+            batch_results = self.model.predict(batch_frame_arrays, **predict_kwargs)
+            
+            
+            processed_count += len(batch_frames)
+            progress = int((processed_count / total_frames_to_process) * 100)
+            send_action(context, "inference_stage_plus_progress", {
+                "task_id": task_id,
+                "progress": progress,
+                "stage": f"Processing frame {processed_count}/{total_frames_to_process}"
+            })
+
+            logging.debug(f'saving result as pickle')
+
+            
+
+            # --- Save batch result as pickle and register chunk ---
+            chunk_id = str(uuid.uuid4())[:8]
+            save_file = os.path.join(save_dir, f'chunk-{chunk_index}.pkl')
+            with open(save_file, 'wb') as f:
+                pickle.dump(batch_results, f)
+
+            context.inference_results[chunk_id] = {
+                'task_id': task_id,
+                'chunk_index': chunk_index,
+                'save_file': save_file,
+                'frame_count': len(batch_results),
+                'frames': batch_frame_indices
+            }
+
+            send_action(context, 'inference_task_chunk_result', {
+                'chunk_id': chunk_id,
+                'chunk_index': chunk_index,
+                'task_id': task_id,
+                'frame_count': len(batch_results)
+            })
+
+            chunk_index += 1
+            # batch_frames goes out of scope → memory freed
+
+        send_action(context, "inference_completed", {
+            "task_id": task_id,
+            "save_dir": save_dir,
+            "result_count": len(all_annotations)
+        })
+
+    @staticmethod
+    def _extract_frames_from_video(video_path, frame_indices):
+        """Extract specific frames from a video file.
+        
+        Returns list of (frame_index, frame_numpy) tuples.
+        Only loads requested frames into memory at once.
+        
+        Uses sequential scan only — seeking via cap.set(CAP_PROP_POS_FRAMES)
+        breaks on HEVC/H.265 videos because reference frames are missing.
+        """
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+
+        frames = []
+        frame_set = set(frame_indices)
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx in frame_set:
+                frames.append((frame_idx, frame.copy()))
+            frame_idx += 1
+
+        cap.release()
+        return frames
+
+    # ------------------------------------------------------------------
+    #  Image inference
+    # ------------------------------------------------------------------
+    def _infer_image(self, payload, context, save_dir):
+        task_id = payload.get("id")
+        file_ids = payload.get("file_ids", [])
+        conf = payload.get("conf", 0.25)
+        iou = payload.get("iou", 0.45)
+        imgsz = payload.get('imgsz', None)
+        classes = payload.get('classes', None)
+
+        if not file_ids:
+            send_action(context, "inference_task_error", {"id": task_id, 'error': 'NO_FILE_IDS_PROVIDED'})
+            return
+
+        # Resolve all file paths
+        file_paths = []
+        for fid in file_ids:
+            file_info = context.get_file_path_from_id(fid)
+            if not file_info:
+                send_action(context, "inference_task_error", {"id": task_id, 'error': f'FILE_PATH_NOT_FOUND for {fid}'})
+                return
+            file_path = file_info["path"] if isinstance(file_info, dict) else file_info
+            file_paths.append(file_path)
+
+        total = len(file_paths)
+        processed_count = 0
+        chunk_index = 0
+
+        # Track chunks in context for later retrieval
+        if task_id not in context.inference_results:
+            context.inference_results[task_id] = {}
+
+        # Process in batches (same logic as video)
+        batch_size = payload.get('batch', 128)
+        file_batches = self._chunk_frames(file_paths, batch_size)
+
+        for batch_paths in file_batches:
+            if context.stop_event.is_set():
+                send_action(context, "task_cancelled", {"id": task_id})
+                return
+
+            # --- Run inference on this batch of images ---
+            predict_kwargs = dict(conf=conf, iou=iou, verbose=True, classes=classes)
+            if imgsz is not None:
+                predict_kwargs['imgsz'] = imgsz
+
+            batch_results = self.model.predict(batch_paths, **predict_kwargs)
+
+            processed_count += len(batch_paths)
+            progress = int((processed_count / total) * 100)
+            send_action(context, "inference_stage_plus_progress", {
+                "task_id": task_id,
+                "progress": progress,
+                "stage": f"Processing image {processed_count}/{total}"
+            })
+
+            # --- Save batch result as pickle and register chunk ---
+            chunk_id = str(uuid.uuid4())[:8]
+            save_file = os.path.join(save_dir, f'chunk-{chunk_index}.pkl')
+            with open(save_file, 'wb') as f:
+                pickle.dump(batch_results, f)
+
+            context.inference_results[chunk_id] = {
+                'task_id': task_id,
+                'chunk_index': chunk_index,
+                'save_file': save_file,
+                'frame_count': len(batch_results),
+                'frames': list(range(processed_count - len(batch_paths), processed_count))
+            }
+
+            send_action(context, 'inference_task_chunk_result', {
+                'chunk_id': chunk_id,
+                'chunk_index': chunk_index,
+                'task_id': task_id,
+                'frame_count': len(batch_results)
+            })
+
+            chunk_index += 1
+
+        send_action(context, "inference_completed", {
+            "task_id": task_id,
+            "save_dir": save_dir,
+            "result_count": processed_count
+        })
+
+
+class samHandler(ModelHandler):
+    """SAM3 client that delegates GPU inference to the remote FastAPI server."""
+
+    def __init__(self, context, payload):
+        super().__init__(context)
+        self.port = 8001
+        self.model_name = "sam3.1"
+        self.base_url = (
+            payload.get("base_url")
+            or payload.get("server_url")
+            or os.environ.get("SAM_SERVER_URL")
+            or context.model_backend_base_url
+        ).rstrip("/")
+
+    def setup(self, payload, context):
+        send_action(
+            context,
+            "model_setup_started",
+            {"model_name": self.model_name},
+        )
+        try:
+            import requests  # noqa: F401
+            import websocket  # noqa: F401
+        except ImportError as exc:
+            send_action(
+                context,
+                "model_setup_error",
+                {"model_name": self.model_name, "error": str(exc)},
+            )
+            return
+        send_action(
+            context,
+            "model_setup_completed",
+            {"model_name": self.model_name},
+        )
+
+    def init(self, payload, context):
+        import requests
+
+        self.base_url = (
+            payload.get("base_url")
+            or payload.get("server_url")
+            or os.environ.get("SAM_SERVER_URL")
+            or self.base_url
+        ).rstrip("/")
+        send_action(
+            context,
+            "model_init_started",
+            {"model_name": self.model_name, "server_url": self.base_url},
+        )
+        try:
+            response = requests.get(f"{self.base_url}/health", timeout=30)
+            response.raise_for_status()
+            health = response.json()
+        except Exception as exc:
+            send_action(
+                context,
+                "model_init_error",
+                {
+                    "model_name": self.model_name,
+                    "server_url": self.base_url,
+                    "error": str(exc),
+                },
+            )
+            return
+        send_action(
+            context,
+            "model_init_completed",
+            {
+                "model_name": self.model_name,
+                "server_url": self.base_url,
+                "server": health,
+            },
+        )
+
+    def destroy(self, payload, context):
+        self.running = False
+        self.tasks.clear()
+        send_action(
+            context,
+            "model_destroyed",
+            {"model_name": self.model_name},
+        )
+
+    def add_task(self, payload, context):
+        task = dict(payload)
+        task["id"] = str(uuid.uuid4())[:16]
+        file_type = task.get("file_type", "image")
+        file_ids = task.get("file_ids") or []
+        if task.get("file_id") and not file_ids:
+            file_ids = [task["file_id"]]
+        if file_type != "image":
+            send_action(
+                context,
+                "create_inference_task_error",
+                {"error": "sam_remote_server_accepts_images_only"},
+            )
+            return
+        if not file_ids:
+            send_action(
+                context,
+                "create_inference_task_error",
+                {"error": "no_file_ids_provided"},
+            )
+            return
+        missing = [file_id for file_id in file_ids if file_id not in context.files_dict]
+        if missing:
+            send_action(
+                context,
+                "create_inference_task_error",
+                {"error": "file_not_found", "file_ids": missing},
+            )
+            return
+        if not task.get("text_prompt"):
+            send_action(
+                context,
+                "create_inference_task_error",
+                {"error": "no_text_prompt_provided"},
+            )
+            return
+        task["file_ids"] = file_ids
+        task["file_type"] = "image"
+        self.tasks.append(task)
+        send_action(context, "task_added", task)
+
+    def handle_train_task(self, payload, context):
+        send_action(
+            context,
+            "not_supported",
+            {"message": "Training is not supported by the SAM3 inference server"},
+        )
+
+    def handle_inference_task(self, payload, context):
+        import requests
+        import websocket
+
+        task_id = payload["id"]
+        file_ids = payload["file_ids"]
+        text_prompt = payload["text_prompt"]
+        confidence = float(payload.get("conf", 0.5))
+        batch_size = max(1, int(payload.get("batch", 2)))
+        save_dir = payload.get("save_dir", f"results/{task_id}")
+        os.makedirs(save_dir, exist_ok=True)
+        context.inference_results.setdefault(task_id, {})
+        queued_batches = []
+
+        for chunk_index, start in enumerate(range(0, len(file_ids), batch_size)):
+            batch_file_ids = file_ids[start : start + batch_size]
+            opened_files = []
+            multipart_files = []
+            try:
+                for file_id in batch_file_ids:
+                    file_info = context.get_file_path_from_id(file_id)
+                    file_path = (
+                        file_info["path"]
+                        if isinstance(file_info, dict)
+                        else file_info
+                    )
+                    stream = open(file_path, "rb")
+                    opened_files.append(stream)
+                    multipart_files.append(
+                        (
+                            "images",
+                            (
+                                os.path.basename(file_path),
+                                stream,
+                                "application/octet-stream",
+                            ),
+                        )
+                    )
+
+                response = requests.post(
+                    f"{self.base_url}/add_to_infererence_queue",
+                    files=multipart_files,
+                    data={
+                        "text_prompt": text_prompt,
+                        "confidence_threshold": confidence,
+                    },
+                    timeout=(30, 300),
+                )
+                response.raise_for_status()
+                queued_batches.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "start": start,
+                        "queued": response.json(),
+                    }
+                )
+            except Exception as exc:
+                send_action(
+                    context,
+                    "inference_task_error",
+                    {"id": task_id, "error": str(exc)},
+                )
+                return
+            finally:
+                for stream in opened_files:
+                    stream.close()
+
+        completed_images = 0
+        websocket_base = self.base_url.replace(
+            "https://", "wss://"
+        ).replace("http://", "ws://")
+
+        for batch_info in queued_batches:
+            queued = batch_info["queued"]
+            remote_job_id = queued["job_id"]
+            websocket_url = websocket_base + queued.get(
+                "websocket_path",
+                f"/ws/{remote_job_id}",
+            )
+            try:
+                connection = websocket.create_connection(
+                    websocket_url,
+                    timeout=3600,
+                    header=["User-Agent: samtoyolo-backend"],
+                )
+                final_message = None
+                try:
+                    while True:
+                        message = json.loads(connection.recv())
+                        if message.get("status") in {
+                            "completed",
+                            "failed",
+                            "not_found",
+                        }:
+                            final_message = message
+                            break
+                finally:
+                    connection.close()
+            except Exception as exc:
+                send_action(
+                    context,
+                    "inference_task_error",
+                    {
+                        "id": task_id,
+                        "remote_job_id": remote_job_id,
+                        "error": str(exc),
+                    },
+                )
+                return
+
+            if final_message.get("status") != "completed":
+                send_action(
+                    context,
+                    "inference_task_error",
+                    {
+                        "id": task_id,
+                        "remote_job_id": remote_job_id,
+                        "error": final_message.get(
+                            "error", final_message["status"]
+                        ),
+                    },
+                )
+                return
+
+            result = final_message["result"]
+            chunk_index = batch_info["chunk_index"]
+            chunk_id = str(uuid.uuid4())[:8]
+            save_file = os.path.join(save_dir, f"chunk-{chunk_index}.pkl")
+            with open(save_file, "wb") as result_file:
+                pickle.dump(result, result_file)
+
+            frame_count = len(result["images"])
+            completed_images += frame_count
+            context.inference_results[chunk_id] = {
+                "task_id": task_id,
+                "chunk_index": chunk_index,
+                "save_file": save_file,
+                "frame_count": frame_count,
+                "frames": list(
+                    range(
+                        batch_info["start"],
+                        batch_info["start"] + frame_count,
+                    )
+                ),
+                "remote_job_id": remote_job_id,
+            }
+            send_action(
+                context,
+                "inference_task_chunk_result",
+                {
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk_index,
+                    "task_id": task_id,
+                    "frame_count": frame_count,
+                },
+            )
+            send_action(
+                context,
+                "inference_stage_plus_progress",
+                {
+                    "task_id": task_id,
+                    "progress": int(
+                        completed_images / len(file_ids) * 100
+                    ),
+                    "stage": (
+                        f"Processed {completed_images}/{len(file_ids)} images"
+                    ),
+                },
+            )
+
+        send_action(
+            context,
+            "inference_completed",
+            {
+                "task_id": task_id,
+                "save_dir": save_dir,
+                "result_count": completed_images,
+            },
+        )

@@ -150,7 +150,7 @@ async def handle_file_upload(file:UploadFile = File(...)):
     file_path = f"files/{file_id}"
     
     # read file
-    content = file.read()
+    content = await file.read()
 
     # write file
     with open(file_path, "wb") as f:
@@ -181,7 +181,6 @@ if __name__ == "__main__":
 #   activate environment
 
 # run pip install -r requirements.txt
-
 
 
 
