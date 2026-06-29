@@ -1,0 +1,37 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+n local terminal from /home/mnprime/Projects/backend, run:
+./create-room-tui
+
+Open Kaggle notebook, enable GPU + Internet.
+
+Paste room ID/secret into Remotes tab.
+
+Copy the generated Kaggle cell into Kaggle and run it.
+
+When create-room-tui prints the public URL, paste it into “Kaggle Tunnel URL”.
+
+Click “Use Kaggle GPU”.
+
+Upload/import/inference/train now run against the Kaggle GPU backend.
