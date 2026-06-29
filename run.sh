@@ -94,6 +94,38 @@ fi
 
 echo "[INFO] Setup complete."
 
+echo "[INFO] Setting up SAM environment..."
+bash sam/sam_env.sh
+
+SAM_ENV_NAME="${SAM_ENV_NAME:-sam}"
+SAM3_PROJECT_DIR="${SAM3_PROJECT_DIR:-/root/sam3}"
+SAM3_CHECKPOINT_PATH="${SAM3_CHECKPOINT_PATH:-$SAM3_PROJECT_DIR/hf/sam3.1_multiplex_mapped.pt}"
+
+echo "[INFO] Starting SAM server on port 8001..."
+tmux kill-session -t sam-server 2>/dev/null || true
+tmux new-session -d -s sam-server \
+    "cd '$PWD' && \
+     SAM3_PROJECT_DIR='$SAM3_PROJECT_DIR' \
+     SAM3_CHECKPOINT_PATH='$SAM3_CHECKPOINT_PATH' \
+     '$MINICONDA_DIR/bin/conda' run --no-capture-output -n '$SAM_ENV_NAME' \
+     python sam/sam_fastapi_server.py"
+
+echo "[INFO] Waiting for SAM server workers..."
+for _ in $(seq 1 120); do
+    health="$(curl -fsS http://127.0.0.1:8001/health 2>/dev/null || true)"
+    if [[ "$health" == *'"status":"ready"'* ]]; then
+        echo "[INFO] SAM server is ready."
+        break
+    fi
+    sleep 5
+done
+
+health="$(curl -fsS http://127.0.0.1:8001/health 2>/dev/null || true)"
+if [[ "$health" != *'"status":"ready"'* ]]; then
+    echo "[ERROR] SAM server did not become ready." >&2
+    tmux capture-pane -pt sam-server >&2 || true
+    exit 1
+fi
 
 export MPLBACKEND=Agg
 
