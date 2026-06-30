@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SAM 3.1 Tester</title>
+<style>
+  :root { --bg:#0e1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --green:#3fb950; --red:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:18px; margin:0; font-weight:600; }
+  header .tag { font-size:12px; color:var(--muted); border:1px solid var(--border); padding:2px 8px; border-radius:20px; }
+  .wrap { display:grid; grid-template-columns: 340px 1fr; gap:0; height: calc(100vh - 51px); }
+  .controls { padding:18px; border-right:1px solid var(--border); overflow-y:auto; }
+  .controls label { display:block; font-size:12px; color:var(--muted); margin:14px 0 5px; text-transform:uppercase; letter-spacing:.04em; }
+  .controls input, .controls select, .controls button { width:100%; padding:9px 10px; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:7px; font-size:14px; }
+  .controls input[type=file] { padding:7px; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  button.primary { background:var(--accent); border:none; color:#fff; font-weight:600; cursor:pointer; margin-top:18px; padding:11px; }
+  button.primary:disabled { opacity:.5; cursor:not-allowed; }
+  .seg { display:flex; border:1px solid var(--border); border-radius:7px; overflow:hidden; }
+  .seg button { border:none; border-radius:0; background:var(--bg); }
+  .seg button.active { background:var(--accent); color:#fff; }
+  .main { padding:18px; overflow-y:auto; }
+  .statusbar { display:flex; align-items:center; gap:14px; margin-bottom:14px; flex-wrap:wrap; }
+  .pill { font-size:13px; padding:4px 12px; border-radius:20px; border:1px solid var(--border); color:var(--muted); }
+  .pill.live { color:var(--green); border-color:var(--green); }
+  .pill.err { color:var(--red); border-color:var(--red); }
+  .progress { flex:1; min-width:160px; height:8px; background:var(--panel); border-radius:6px; overflow:hidden; }
+  .progress > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #log { font-family: ui-monospace, monospace; font-size:12px; color:var(--muted); background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px; height:90px; overflow-y:auto; margin-bottom:16px; white-space:pre-wrap; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .card img { width:100%; display:block; background:#000; }
+  .card .meta { padding:8px 10px; font-size:12px; display:flex; justify-content:space-between; align-items:center; }
+  .badge { background:var(--accent); color:#fff; border-radius:12px; padding:1px 9px; font-weight:600; }
+  .badge.zero { background:#444; }
+  .hero { text-align:center; }
+  .hero img { max-width:100%; max-height:70vh; border-radius:10px; border:1px solid var(--border); }
+  .muted { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SAM 3.1 Tester</h1>
+  <span class="tag">realtime segmentation</span>
+  <span class="tag" id="backendTag"></span>
+</header>
+<div class="wrap">
+  <div class="controls">
+    <label>Mode</label>
+    <div class="seg" id="modeSeg">
+      <button data-mode="image" class="active">Image</button>
+      <button data-mode="video">Video</button>
+    </div>
+
+    <label id="fileLabel">Image file</label>
+    <input type="file" id="file" accept="image/*" />
+
+    <label>Text prompt</label>
+    <input type="text" id="prompt" placeholder="e.g. car, person, bus" value="car" />
+
+    <div id="videoOpts" style="display:none;">
+      <div class="row">
+        <div>
+          <label>Sample FPS</label>
+          <input type="number" id="fps" value="2" step="0.5" min="0.1" />
+        </div>
+        <div>
+          <label>Max frames</label>
+          <input type="number" id="maxFrames" value="0" min="0" placeholder="0 = all" />
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Confidence</label>
+        <input type="number" id="conf" value="0.5" step="0.05" min="0" max="1" />
+      </div>
+      <div>
+        <label>Batch</label>
+        <input type="number" id="batch" value="4" min="1" />
+      </div>
+    </div>
+
+    <label>Backend URL</label>
+    <input type="text" id="backend" value="http://163.61.236.112:20000" />
+    <label>SAM server URL (backend-side)</label>
+    <input type="text" id="sam" value="http://127.0.0.1:8001" />
+
+    <button class="primary" id="runBtn">Run inference</button>
+  </div>
+
+  <div class="main">
+    <div class="statusbar">
+      <span class="pill" id="state">idle</span>
+      <div class="progress"><div id="bar"></div></div>
+      <span class="pill" id="counts">0 / 0</span>
+      <span class="pill" id="timer"></span>
+    </div>
+    <div id="log"></div>
+    <div id="results" class="grid"></div>
+  </div>
+</div>
+
+<script>
+let mode = "image";
+const $ = (id) => document.getElementById(id);
+
+$("backendTag").textContent = "";
+
+$("modeSeg").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  mode = b.dataset.mode;
+  [...$("modeSeg").children].forEach(x => x.classList.toggle("active", x === b));
+  $("videoOpts").style.display = mode === "video" ? "block" : "none";
+  $("fileLabel").textContent = mode === "video" ? "Video file" : "Image file";
+  $("file").accept = mode === "video" ? "video/*" : "image/*";
+});
+
+function log(msg) {
+  const el = $("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function setState(txt, cls) {
+  const el = $("state");
+  el.textContent = txt;
+  el.className = "pill" + (cls ? " " + cls : "");
+}
+
+$("runBtn").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) { alert("Choose a file first"); return; }
+  $("runBtn").disabled = true;
+  $("results").innerHTML = "";
+  $("log").textContent = "";
+  $("bar").style.width = "0";
+  setState("uploading…");
+
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("mode", mode);
+  fd.append("prompt", $("prompt").value);
+  fd.append("fps", $("fps").value);
+  fd.append("max_frames", $("maxFrames").value || 0);
+  fd.append("conf", $("conf").value);
+  fd.append("batch", $("batch").value);
+  fd.append("backend_url", $("backend").value);
+  fd.append("sam_url", $("sam").value);
+
+  let job_id;
+  try {
+    const r = await fetch("/api/start", { method: "POST", body: fd });
+    job_id = (await r.json()).job_id;
+  } catch (e) { setState("upload failed", "err"); $("runBtn").disabled = false; return; }
+
+  log("job " + job_id + " started");
+  const ws = new WebSocket(`ws://${location.host}/api/ws/${job_id}`);
+  let total = 0, received = 0, totalDet = 0;
+  const start = Date.now();
+  const isImage = mode === "image";
+
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    switch (m.event) {
+      case "ping": break;
+      case "status": log(m.message); setState("running", "live"); break;
+      case "meta":
+        total = m.total;
+        $("counts").textContent = `0 / ${total}`;
+        log(`prompt="${m.prompt}" conf=${m.conf} batch=${m.batch} mode=${m.mode}`);
+        break;
+      case "upload_progress":
+        setState("uploading…", "live");
+        $("bar").style.width = (m.done / m.total * 30) + "%";
+        $("counts").textContent = `upload ${m.done}/${m.total}`;
+        break;
+      case "frame":
+        received++;
+        totalDet += m.detections;
+        addFrame(m, isImage);
+        $("bar").style.width = (30 + received / total * 70) + "%";
+        $("counts").textContent = `${received} / ${total}  ·  ${totalDet} det`;
+        $("timer").textContent = ((Date.now() - start) / 1000).toFixed(1) + "s";
+        break;
+      case "done":
+        setState("done", "live");
+        $("bar").style.width = "100%";
+        log(`DONE — ${m.frames} frames, ${m.chunks} chunks, ${m.seconds}s (task ${m.task_id})`);
+        $("runBtn").disabled = false;
+        break;
+      case "error":
+        setState("error", "err");
+        log("ERROR: " + m.message);
+        if (m.trace) log(m.trace);
+        $("runBtn").disabled = false;
+        break;
+    }
+  };
+  ws.onclose = () => { $("runBtn").disabled = false; };
+  ws.onerror = () => { setState("ws error", "err"); $("runBtn").disabled = false; };
+});
+
+function addFrame(m, isImage) {
+  if (isImage) {
+    $("results").className = "hero";
+    $("results").innerHTML =
+      `<img src="data:image/jpeg;base64,${m.image}" />
+       <p class="muted">${m.detections} detections · scores: ${m.scores.join(", ") || "—"}</p>`;
+    return;
+  }
+  $("results").className = "grid";
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML =
+    `<img src="data:image/jpeg;base64,${m.image}" />
+     <div class="meta"><span>frame ${m.index}</span>
+       <span class="badge ${m.detections ? "" : "zero"}">${m.detections}</span></div>`;
+  $("results").appendChild(card);
+}
+</script>
+</body>
+</html>

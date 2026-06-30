@@ -140,6 +140,10 @@ async def handle_file_upload(file:UploadFile = File(...)):
     
     # generate file_id
 
+    # ensure the storage directory exists (the download handlers create it, but
+    # a fresh checkout may reach /upload first — without this, open() 500s)
+    os.makedirs("files", exist_ok=True)
+
     file_id = str(uuid.uuid4())[:16]
     while os.path.exists(f"files/{file_id}"):
         file_id = str(uuid.uuid4())[:16]
@@ -148,7 +152,7 @@ async def handle_file_upload(file:UploadFile = File(...)):
 
     # Create file path
     file_path = f"files/{file_id}"
-    
+
     # read file
     content = await file.read()
 

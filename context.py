@@ -113,11 +113,18 @@ class Context:
                         self.send_action_queue.return_object(msg, success=False)
                         continue
                     
-                    # Schedule the async send on the event loop
+                    # Schedule the async send on the event loop. We bound the
+                    # send with asyncio.wait_for *inside* the coroutine so that a
+                    # stalled write (e.g. a client that stopped reading behind an
+                    # FRP tunnel) is cancelled on the loop instead of blocking it
+                    # forever — which would otherwise wedge the entire server.
+                    async def _bounded_send(coro=ws.send_text(msg.data)):
+                        await asyncio.wait_for(coro, timeout=10)
+
                     future = asyncio.run_coroutine_threadsafe(
-                        ws.send_text(msg.data), self._loop
+                        _bounded_send(), self._loop
                     )
-                    future.result(timeout=10)  # wait for send to complete
+                    future.result(timeout=15)  # wait for send to complete
                     logging.debug(f"Sent message: {msg.data}")
                     self.send_action_queue.return_object(msg, success=True)
                 except Exception as e:

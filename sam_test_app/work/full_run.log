@@ -1,0 +1,38 @@
+Sampling video at 2.0 fps ...
+  src_fps=25.00 step=12 -> 625 frames
+Init SAM ...
+  [model_init_completed] {'model_name': 'sam3.1', 'server_url': 'http://127.0.0.1:8001', 'server': {'status': 'ready', 'port': 8001, 'gpu_count': 2, 'ready_workers': 2, 'queue_size': 0}, 'worker_id': 'aece1f4a-e192-4b'}
+  server: {'status': 'ready', 'port': 8001, 'gpu_count': 2, 'ready_workers': 2, 'queue_size': 0}
+Uploading 625 file(s) ...
+Running inference (prompt='person', conf=0.5, batch=8) ...
+Traceback (most recent call last):
+  File "/home/hamim-mahmud/Workspace/samtoyolo/backend/sam_test_app/smoke_test.py", line 98, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/hamim-mahmud/Workspace/samtoyolo/backend/sam_test_app/smoke_test.py", line 86, in main
+    task_id, chunks = client.run_inference(
+                      ~~~~~~~~~~~~~~~~~~~~^
+        file_ids, args.prompt, conf=args.conf, batch=args.batch, on_event=log_event
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/hamim-mahmud/Workspace/samtoyolo/backend/sam_test_app/sam_client.py", line 247, in run_inference
+        for fut in as_completed(futs):
+    ...<5 lines>...
+    
+  File "/home/hamim-mahmud/Workspace/samtoyolo/backend/sam_test_app/sam_client.py", line 197, in send
+    self.ws.send(json.dumps({"action": action, "payload": payload or {}}))
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hamim-mahmud/.miniconda3/lib/python3.13/site-packages/websocket/_core.py", line 304, in send
+    return self.send_frame(frame)
+           ~~~~~~~~~~~~~~~^^^^^^^
+  File "/home/hamim-mahmud/.miniconda3/lib/python3.13/site-packages/websocket/_core.py", line 344, in send_frame
+    bytes_sent = self._send(data)
+  File "/home/hamim-mahmud/.miniconda3/lib/python3.13/site-packages/websocket/_core.py", line 577, in _send
+    return send(self.sock, data)
+  File "/home/hamim-mahmud/.miniconda3/lib/python3.13/site-packages/websocket/_socket.py", line 193, in send
+    return _send()
+  File "/home/hamim-mahmud/.miniconda3/lib/python3.13/site-packages/websocket/_socket.py", line 167, in _send
+    return sock.send(data)
+           ~~~~~~~~~^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
