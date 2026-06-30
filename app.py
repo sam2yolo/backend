@@ -1,7 +1,8 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
 from actionhandler import handle_action
 import io
+import mimetypes
 import os
 
 from modelhandler import yoloHandler
@@ -9,6 +10,7 @@ from modelhandler import yoloHandler
 import asyncio
 from context import *
 from contextlib import asynccontextmanager
+from video_utils import maybe_convert_dav, storage_path_for_file
 
 # Configure the logging system
 logging.basicConfig(
@@ -135,6 +137,21 @@ async def get_inference_result(id:str):
         )                            
 
 
+@app.get('/file')
+async def get_uploaded_file(id: str):
+    file_info = context.files_dict.get(id)
+    if not file_info:
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+
+    file_path = file_info["path"] if isinstance(file_info, dict) else file_info
+    if not file_path or not os.path.exists(file_path):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+
+    file_name = file_info.get("name") if isinstance(file_info, dict) else os.path.basename(file_path)
+    media_type = mimetypes.guess_type(file_name or file_path)[0] or "application/octet-stream"
+    return FileResponse(file_path, media_type=media_type, filename=file_name or os.path.basename(file_path))
+
+
 @app.post('/upload')
 async def handle_file_upload(file:UploadFile = File(...)):
     
@@ -144,14 +161,18 @@ async def handle_file_upload(file:UploadFile = File(...)):
     # a fresh checkout may reach /upload first — without this, open() 500s)
     os.makedirs("files", exist_ok=True)
 
-    file_id = str(uuid.uuid4())[:16]
-    while os.path.exists(f"files/{file_id}"):
-        file_id = str(uuid.uuid4())[:16]
-
     file_name = file.filename
 
+    file_id = str(uuid.uuid4())[:16]
+    while (
+        os.path.exists(f"files/{file_id}") or
+        os.path.exists(f"files/{file_id}.dav") or
+        os.path.exists(f"files/{file_id}.mp4")
+    ):
+        file_id = str(uuid.uuid4())[:16]
+
     # Create file path
-    file_path = f"files/{file_id}"
+    file_path = storage_path_for_file(file_id, file_name)
 
     # read file
     content = await file.read()
@@ -160,16 +181,20 @@ async def handle_file_upload(file:UploadFile = File(...)):
     with open(file_path, "wb") as f:
             f.write(content)
 
-    
-    file_meta = {"path": f"files/{file_id}", "name": file_name}
+    file_meta = await asyncio.to_thread(maybe_convert_dav, file_id, file_path, file_name)
 
     # save file meta to context:
-    context.files_dict[file_id] = {"path": f"files/{file_id}", "name": file_name}
+    context.files_dict[file_id] = file_meta
 
 
     return JSONResponse({
         'status':200,
-        'file_id':file_id
+        'file_id':file_id,
+        'file_path': file_meta["path"],
+        'file_name': file_meta["name"],
+        'original_name': file_meta.get("original_name"),
+        'converted': file_meta.get("converted", False),
+        'conversion_error': file_meta.get("conversion_error")
     })
 
 if __name__ == "__main__":
@@ -185,6 +210,3 @@ if __name__ == "__main__":
 #   activate environment
 
 # run pip install -r requirements.txt
-
-
-

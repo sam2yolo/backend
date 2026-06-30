@@ -16,6 +16,7 @@ import pickle
 from modelhandler import ModelHandler
 from commons import send_action
 import threading
+from video_utils import maybe_convert_dav, storage_path_for_file
 
 # List of actions accepeted by the server
 # ping: {"action": "ping", "payload": {}}
@@ -158,19 +159,25 @@ async def handle_download_file_wget(websocket: WebSocket, data: dict, context: C
     url = data.get("url")
 
     def worker(url: str, context: Context):
+        # get acutal file name from url
+        file_name = url.split("/")[-1].split("?")[0] or "download"
+
         # generate a 16 char uuid for the file check if the uuid already exists in the files directory if it does generate a new one until we get a unique uuid this is to avoid file name conflicts in the files directory
         file_id = str(uuid.uuid4())[:16]
-        while os.path.exists(f"files/{file_id}"):
+        while (
+            os.path.exists(f"files/{file_id}") or
+            os.path.exists(f"files/{file_id}.dav") or
+            os.path.exists(f"files/{file_id}.mp4")
+        ):
             file_id = str(uuid.uuid4())[:16]
 
-        # get acutal file name from url
-        file_name = url.split("/")[-1]
         os.makedirs("files", exist_ok=True)
+        file_path = storage_path_for_file(file_id, file_name)
 
         # send file_download_initiated message to client
         send_action(context, "file_download_initiated", {
             "file_id": file_id,
-            "expected_path": f"files/{file_id}",
+            "expected_path": file_path,
             "file_name": file_name
         })
 
@@ -183,11 +190,11 @@ async def handle_download_file_wget(websocket: WebSocket, data: dict, context: C
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
             block_size = 1024
-            with open(f"files/{file_id}", "wb") as f:
+            with open(file_path, "wb") as f:
                 for chunk in response.iter_content(block_size):
                     if context.stop_event.is_set():
                         logging.info(f"Download {file_id} cancelled by stop event")
-                        os.remove(f"files/{file_id}")
+                        os.remove(file_path)
                         return
                     f.write(chunk)
                     # send download_progress message to client via queue
@@ -198,12 +205,17 @@ async def handle_download_file_wget(websocket: WebSocket, data: dict, context: C
                         "timestamp": current_time,
                         "total_size": total_size
                     })
-                # add entry to files_dict in context
-                context.files_dict[file_id] = {"path": f"files/{file_id}", "name": file_name}
-                send_action(context, "file_download_completed", {
-                    "file_id": file_id,
-                    "file_path": f"files/{file_id}"
-                })
+            # add entry to files_dict in context
+            file_meta = maybe_convert_dav(file_id, file_path, file_name)
+            context.files_dict[file_id] = file_meta
+            send_action(context, "file_download_completed", {
+                "file_id": file_id,
+                "file_path": file_meta["path"],
+                "file_name": file_meta["name"],
+                "original_name": file_meta.get("original_name"),
+                "converted": file_meta.get("converted", False),
+                "conversion_error": file_meta.get("conversion_error")
+            })
 
         except Exception as e:
             logging.error(f"File download failed for url {url}: {e}")
@@ -316,8 +328,8 @@ def _download_google_drive_worker(url: str, context: Context):
         })
         return
 
-    final_path = f"files/{file_id}"
     original_name = os.path.basename(expected_path)
+    final_path = storage_path_for_file(file_id, original_name)
     try:
         shutil.move(expected_path, final_path)
     except Exception as e:
@@ -328,11 +340,15 @@ def _download_google_drive_worker(url: str, context: Context):
         })
         return
 
-    context.files_dict[file_id] = {"path": final_path, "name": original_name}
+    file_meta = maybe_convert_dav(file_id, final_path, original_name)
+    context.files_dict[file_id] = file_meta
     send_action(context, "file_download_completed", {
         "file_id": file_id,
-        "file_path": final_path,
-        "file_name": original_name
+        "file_path": file_meta["path"],
+        "file_name": file_meta["name"],
+        "original_name": file_meta.get("original_name"),
+        "converted": file_meta.get("converted", False),
+        "conversion_error": file_meta.get("conversion_error")
     })
 
 
@@ -351,7 +367,17 @@ async def handle_download_file_google_drive(websocket: WebSocket, data: dict, co
 
 @register("list_files")
 async def handle_list_files(websocket: WebSocket, data: dict, context: Context):
-    file_list = [{"id": fid, "path": info["path"], "name": info["name"]} for fid, info in context.files_dict.items()]
+    file_list = [
+        {
+            "id": fid,
+            "path": info["path"],
+            "name": info["name"],
+            "original_name": info.get("original_name"),
+            "converted": info.get("converted", False),
+            "conversion_error": info.get("conversion_error")
+        }
+        for fid, info in context.files_dict.items()
+    ]
     await websocket.send_text(json.dumps({"action": "file_list", "payload": {"files": file_list}}))
 
 @register("delete_file")

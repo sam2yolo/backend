@@ -29,9 +29,12 @@ export async function POST({ request }) {
 				throw new Error(result.error || `Backend rejected ${file.name}`);
 			uploaded.push({
 				id: result.file_id,
-				name: file.name,
-				path: `files/${result.file_id}`,
-				size: file.size
+				name: result.file_name || file.name,
+				path: result.file_path || `files/${result.file_id}`,
+				size: file.size,
+				originalName: result.original_name || file.name,
+				converted: Boolean(result.converted),
+				conversionError: result.conversion_error || ''
 			});
 		}
 

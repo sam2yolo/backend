@@ -1,7 +1,13 @@
 <script>
 	import { resolve } from '$app/paths';
 	import { onDestroy, onMount } from 'svelte';
-	import { createRoom, listWorkers, randomWorkerName, bootstrapCommand } from '$lib/broker';
+	import {
+		createRoom,
+		listWorkers,
+		randomWorkerName,
+		bootstrapCommand,
+		notebookBootstrapCell
+	} from '$lib/broker';
 	import { renderResult, decodeMask } from '$lib/sammask';
 	import { buildYoloDataset } from '$lib/dataset';
 	import { maskToPolygons } from '$lib/contours';
@@ -30,13 +36,16 @@
 		Truck: 7
 	};
 	const datasetImportModes = ['upload', 'drive', 'direct'];
-	const defaultKaggleNotebookRef = 'mursalinnasib/notebooka28c21424b';
-	const kaggleSetupSteps = [
-		'Open your existing Kaggle notebook and make sure GPU acceleration plus internet are enabled.',
-		'Run ./create-room-tui locally from this backend folder to create a tunnel room.',
-		'Paste the room ID and secret here, then copy the generated cell into that notebook.',
-		'When the local room tool prints a public URL, paste that URL below and connect.'
-	];
+	const fleetSessionStorageKey = 'samtoyoloFleetSession';
+	const imageExtensionPattern = /\.(jpe?g|png|webp|bmp)$/i;
+	const videoExtensionPattern = /\.(mp4|mov|m4v|webm|avi|mkv|dav)$/i;
+	const mediaExtensionPattern = /\.(jpe?g|png|webp|bmp|mp4|mov|m4v|webm|avi|mkv|dav)$/i;
+	const datasetExtensionPattern =
+		/\.(zip|ya?ml|txt|json|csv|jpe?g|png|webp|bmp|mp4|mov|m4v|webm|avi|mkv|dav)$/i;
+	const localMediaAccept =
+		'image/*,video/*,.jpg,.jpeg,.png,.webp,.bmp,.mp4,.mov,.m4v,.webm,.avi,.mkv,.dav';
+	const datasetAccept =
+		'.zip,.yaml,.yml,.txt,.json,.csv,image/*,video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv,.dav';
 
 	let activeTab = $state('Overview');
 	let toast = $state('');
@@ -59,12 +68,6 @@
 	let samBatch = $state(4);
 	let samFps = $state(2); // frames/sec to sample from video for SAM
 	let samMaxFrames = $state(40); // cap sampled frames (0 = all)
-	let kaggleNotebookRef = $state(defaultKaggleNotebookRef);
-	let kaggleRoomId = $state('');
-	let kaggleRoomSecret = $state('');
-	let kaggleNotebookName = $state('notebooka28c21424b');
-	let kaggleTunnelUrl = $state('');
-
 	// --- Fleet: auto-created room + workers discovered via the broker ---
 	let fleetRoomId = $state('');
 	let fleetRoomSecret = $state('');
@@ -98,6 +101,16 @@
 	let localFileInput = $state();
 	let uploadBusy = $state(false);
 	let googleDriveUrl = $state('');
+	let uploadProgress = $state({
+		visible: false,
+		active: false,
+		kind: '',
+		fileId: '',
+		label: '',
+		detail: '',
+		value: 0
+	});
+	let uploadProgressTimer;
 
 	let promptTags = $state([]);
 	let selectedPromptType = $state('');
@@ -157,6 +170,134 @@
 		return true;
 	}
 
+	function clampProgress(value) {
+		const number = Number(value);
+		if (!Number.isFinite(number)) return 0;
+		return Math.max(0, Math.min(100, Math.round(number)));
+	}
+
+	function formatBytes(bytes = 0) {
+		const value = Number(bytes) || 0;
+		if (value < 1024) return `${value} B`;
+		const units = ['KB', 'MB', 'GB', 'TB'];
+		let size = value / 1024;
+		let unit = units[0];
+		for (let i = 1; i < units.length && size >= 1024; i += 1) {
+			size /= 1024;
+			unit = units[i];
+		}
+		return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${unit}`;
+	}
+
+	function startUploadProgress(kind, label, detail = 'Preparing upload') {
+		clearTimeout(uploadProgressTimer);
+		uploadProgress = {
+			visible: true,
+			active: true,
+			kind,
+			fileId: '',
+			label,
+			detail,
+			value: 0
+		};
+	}
+
+	function updateUploadProgress(attrs = {}) {
+		clearTimeout(uploadProgressTimer);
+		uploadProgress = {
+			...uploadProgress,
+			visible: true,
+			active: attrs.active ?? uploadProgress.active,
+			...attrs,
+			value: clampProgress(attrs.value ?? uploadProgress.value)
+		};
+	}
+
+	function finishUploadProgress(detail = 'Completed') {
+		updateUploadProgress({ active: false, detail, value: 100 });
+		uploadProgressTimer = setTimeout(() => {
+			uploadProgress = { ...uploadProgress, visible: false };
+		}, 1800);
+	}
+
+	function failUploadProgress(detail = 'Upload failed') {
+		updateUploadProgress({ active: false, detail });
+		uploadProgressTimer = setTimeout(() => {
+			uploadProgress = { ...uploadProgress, visible: false };
+		}, 3200);
+	}
+
+	function remoteDownloadLabel(payload = {}) {
+		const name = payload.file_name || payload.expected_path?.split('/').pop();
+		if (name) return `Downloading ${name}`;
+		if (uploadProgress.kind === 'direct-download') return 'Direct URL download';
+		return 'Google Drive download';
+	}
+
+	function uploadFilesViaApi(items, options = {}) {
+		const {
+			names = [],
+			targetUrl = backendUrl,
+			label = 'Direct upload',
+			detail = `${items.length} file${items.length === 1 ? '' : 's'} selected`
+		} = options;
+
+		startUploadProgress('local', label, detail);
+		const body = new FormData();
+		items.forEach((item, index) => {
+			body.append('files', item, names[index] || item.name || `upload-${index + 1}`);
+		});
+		body.append('backendUrl', targetUrl);
+
+		return new Promise((resolve, reject) => {
+			const xhr = new XMLHttpRequest();
+			xhr.open('POST', '/api/uploads');
+			xhr.responseType = 'json';
+
+			xhr.upload.addEventListener('progress', (event) => {
+				if (!event.lengthComputable) {
+					updateUploadProgress({
+						value: Math.max(uploadProgress.value, 5),
+						detail: 'Uploading to website'
+					});
+					return;
+				}
+
+				const value = Math.min(99, (event.loaded / event.total) * 100);
+				updateUploadProgress({
+					value,
+					detail:
+						value >= 99
+							? 'Saving to backend'
+							: `${formatBytes(event.loaded)} of ${formatBytes(event.total)}`
+				});
+			});
+
+			xhr.upload.addEventListener('load', () => {
+				updateUploadProgress({ value: 99, detail: 'Saving to backend' });
+			});
+
+			xhr.addEventListener('load', () => {
+				let result = xhr.response;
+				if (!result && xhr.responseText) {
+					try {
+						result = JSON.parse(xhr.responseText);
+					} catch {
+						result = {};
+					}
+				}
+				if (xhr.status >= 200 && xhr.status < 300) {
+					resolve(result || {});
+					return;
+				}
+				reject(new Error(result?.message || result?.error || 'Upload failed'));
+			});
+			xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+			xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+			xhr.send(body);
+		});
+	}
+
 	function connectBackend() {
 		socket?.close?.();
 		connectionState = 'Connecting';
@@ -184,7 +325,36 @@
 	}
 
 	// --- Fleet / room management ------------------------------------------
-	async function createFleetRoom() {
+	function saveFleetSession() {
+		if (!fleetRoomId || !fleetRoomSecret) return;
+		localStorage.setItem(
+			fleetSessionStorageKey,
+			JSON.stringify({
+				room_id: fleetRoomId,
+				room_secret: fleetRoomSecret,
+				worker_name: fleetWorkerName
+			})
+		);
+	}
+
+	function restoreFleetSession() {
+		try {
+			const raw = localStorage.getItem(fleetSessionStorageKey);
+			if (!raw) return false;
+			const session = JSON.parse(raw);
+			if (!session?.room_id || !session?.room_secret) return false;
+			fleetRoomId = session.room_id;
+			fleetRoomSecret = session.room_secret;
+			fleetWorkerName = session.worker_name || randomWorkerName();
+			return true;
+		} catch {
+			localStorage.removeItem(fleetSessionStorageKey);
+			return false;
+		}
+	}
+
+	async function createFleetRoom({ auto = false } = {}) {
+		if (fleetBusy || fleetRoomId) return;
 		fleetBusy = true;
 		fleetError = '';
 		try {
@@ -192,7 +362,8 @@
 			fleetRoomId = room.room_id;
 			fleetRoomSecret = room.room_secret;
 			if (!fleetWorkerName) fleetWorkerName = randomWorkerName();
-			notify('Room created — paste the command on each GPU machine');
+			saveFleetSession();
+			notify(auto ? 'Notebook room is ready' : 'Room created');
 			startFleetPolling();
 		} catch (error) {
 			fleetError = error?.message || 'Could not create room';
@@ -202,13 +373,27 @@
 		}
 	}
 
+	function currentFleetWorkerName() {
+		if (!fleetWorkerName) {
+			fleetWorkerName = randomWorkerName();
+			saveFleetSession();
+		}
+		return fleetWorkerName;
+	}
+
 	function fleetCommand() {
 		if (!fleetRoomId) return '';
-		return bootstrapCommand(fleetRoomId, fleetRoomSecret, fleetWorkerName || randomWorkerName());
+		return bootstrapCommand(fleetRoomId, fleetRoomSecret, currentFleetWorkerName());
+	}
+
+	function fleetNotebookCell() {
+		if (!fleetRoomId || !fleetRoomSecret) return '';
+		return notebookBootstrapCell(fleetRoomId, fleetRoomSecret, currentFleetWorkerName());
 	}
 
 	function regenerateWorkerName() {
 		fleetWorkerName = randomWorkerName();
+		saveFleetSession();
 	}
 
 	async function refreshFleetWorkers() {
@@ -237,10 +422,14 @@
 		const command = fleetCommand();
 		if (!command) return;
 		navigator.clipboard?.writeText(command);
-		// Each machine in the room needs a unique name; roll a fresh one so the
-		// next copy targets a new worker (room_id/secret stay stable).
-		fleetWorkerName = randomWorkerName();
-		notify('Command copied · new worker name generated for the next machine');
+		notify('Terminal command copied');
+	}
+
+	function copyFleetNotebookCell() {
+		const cell = fleetNotebookCell();
+		if (!cell) return;
+		navigator.clipboard?.writeText(cell);
+		notify('Notebook cell copied');
 	}
 
 	function connectToWorker(worker) {
@@ -284,12 +473,8 @@
 					connectionState = 'Connected';
 					break;
 				case 'file_list':
-					uploadedImports = (payload.files || []).map((file) => ({ ...file, id: file.id }));
-					if (!selectedImportId && mediaAssets().length) selectedImportId = mediaAssets()[0].id;
-					if (!selectedDatasetId && datasetAssets().length)
-						selectedDatasetId = datasetAssets()[0].id;
-					if (!selectedTrainingAnchorId && mediaAssets().length)
-						selectedTrainingAnchorId = mediaAssets()[0].id;
+					uploadedImports = (payload.files || []).map(normalizeBackendFile);
+					reconcileAssetSelections();
 					break;
 				case 'list_models_response':
 					remotes = payload.models || [];
@@ -323,21 +508,42 @@
 						status: 'Downloading',
 						progress: 0
 					});
+					updateUploadProgress({
+						kind: uploadProgress.kind || 'drive',
+						fileId: payload.file_id,
+						label: remoteDownloadLabel(payload),
+						detail: 'Download started',
+						value: 0
+					});
 					break;
 				case 'download_progress':
 					upsertTask(payload.file_id, { status: 'Downloading', progress: payload.progress ?? 0 });
+					updateUploadProgress({
+						kind: uploadProgress.kind || 'drive',
+						fileId: payload.file_id || uploadProgress.fileId,
+						label: uploadProgress.label || remoteDownloadLabel(payload),
+						detail:
+							payload.progress == null
+								? 'Downloading'
+								: `${clampProgress(payload.progress)}%${
+										payload.total_size ? ` of ${payload.total_size}` : ''
+									}`,
+						value: payload.progress == null ? Math.max(uploadProgress.value, 5) : payload.progress
+					});
 					break;
 				case 'file_download_completed':
 					upsertTask(payload.file_id, { status: 'Completed', progress: 100 });
 					googleDriveUrl = '';
 					datasetDirectUrl = '';
 					uploadBusy = false;
+					finishUploadProgress('Download complete');
 					send('list_files');
 					notify('Backend download completed');
 					break;
 				case 'download_failed':
 					upsertTask(payload.file_id, { status: 'Failed' });
 					uploadBusy = false;
+					failUploadProgress(errorMessage(payload));
 					notify(errorMessage(payload));
 					break;
 				case 'task_added':
@@ -419,8 +625,42 @@
 		return mediaAssets().find((file) => file.id === selectedImportId);
 	}
 
+	function normalizeBackendFile(file) {
+		return {
+			...file,
+			id: file.id,
+			originalName: file.originalName || file.original_name || '',
+			converted: Boolean(file.converted),
+			conversionError: file.conversionError || file.conversion_error || ''
+		};
+	}
+
+	function hasAssetId(list, id) {
+		return !!id && list.some((file) => file.id === id);
+	}
+
+	function reconcileAssetSelections({
+		preferredMediaId = '',
+		preferredDatasetId = '',
+		preferredTrainingAnchorId = preferredMediaId
+	} = {}) {
+		const media = mediaAssets();
+		const datasets = datasetAssets();
+
+		if (hasAssetId(media, preferredMediaId)) selectedImportId = preferredMediaId;
+		else if (!hasAssetId(media, selectedImportId)) selectedImportId = media[0]?.id || '';
+
+		if (hasAssetId(media, preferredTrainingAnchorId))
+			selectedTrainingAnchorId = preferredTrainingAnchorId;
+		else if (!hasAssetId(media, selectedTrainingAnchorId))
+			selectedTrainingAnchorId = media[0]?.id || '';
+
+		if (hasAssetId(datasets, preferredDatasetId)) selectedDatasetId = preferredDatasetId;
+		else if (!hasAssetId(datasets, selectedDatasetId)) selectedDatasetId = datasets[0]?.id || '';
+	}
+
 	function isMediaFile(file) {
-		return /\.(jpe?g|png|webp|bmp|mp4|mov|m4v|webm|avi|mkv)$/i.test(file?.name || '');
+		return mediaExtensionPattern.test(file?.name || '');
 	}
 
 	function mediaAssets() {
@@ -432,7 +672,7 @@
 	}
 
 	function detectFileType(name = '') {
-		return /\.(jpe?g|png|webp|bmp)$/i.test(name) ? 'image' : 'video';
+		return imageExtensionPattern.test(name) ? 'image' : 'video';
 	}
 
 	function fileKind(file) {
@@ -440,17 +680,17 @@
 		if (/\.(zip)$/i.test(name)) return 'dataset zip';
 		if (/\.(ya?ml)$/i.test(name)) return 'data config';
 		if (/\.(txt|json|csv)$/i.test(name)) return 'labels';
-		if (/\.(jpe?g|png|webp|bmp)$/i.test(name)) return 'image';
-		if (/\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(name)) return 'video';
+		if (imageExtensionPattern.test(name)) return 'image';
+		if (videoExtensionPattern.test(name)) return 'video';
 		return 'asset';
 	}
 
+	function isDavFile(file) {
+		return /\.dav$/i.test(file?.name || '') || /\.dav$/i.test(file?.path || '');
+	}
+
 	function datasetAssets() {
-		return uploadedImports.filter((file) =>
-			/\.(zip|ya?ml|txt|json|csv|jpe?g|png|webp|bmp|mp4|mov|m4v|webm|avi|mkv)$/i.test(
-				file.name || ''
-			)
-		);
+		return uploadedImports.filter((file) => datasetExtensionPattern.test(file.name || ''));
 	}
 
 	function selectedDatasetAsset() {
@@ -460,6 +700,24 @@
 	function resultDownloadUrl(chunkId) {
 		const params = new URLSearchParams({ id: chunkId, backend: backendUrl });
 		return `${resolve('/api/results')}?${params.toString()}`;
+	}
+
+	function backendFileUrl(file) {
+		const params = new URLSearchParams({ id: file.id, backend: backendUrl });
+		return `${resolve('/api/files')}?${params.toString()}`;
+	}
+
+	async function ensureOriginalUrl(file) {
+		if (originalUrls[file.id]) return originalUrls[file.id];
+		const response = await fetch(backendFileUrl(file));
+		if (!response.ok) {
+			const message = await response.text();
+			throw new Error(message || 'Could not load backend video for sampling');
+		}
+		const blob = await response.blob();
+		const url = URL.createObjectURL(blob);
+		originalUrls = { ...originalUrls, [file.id]: url };
+		return url;
 	}
 
 	async function downloadResult(chunkId) {
@@ -562,13 +820,17 @@
 
 	// Upload an array of Blobs (e.g. sampled video frames) as images; returns the
 	// backend file records (in order).
-	async function uploadBlobs(blobs, names, targetUrl = backendUrl) {
-		const body = new FormData();
-		blobs.forEach((blob, i) => body.append('files', blob, names[i]));
-		body.append('backendUrl', targetUrl);
-		const response = await fetch('/api/uploads', { method: 'POST', body });
-		const result = await response.json();
-		if (!response.ok) throw new Error(result.message || 'Frame upload failed');
+	async function uploadBlobs(blobs, names, targetUrl = backendUrl, label = 'Frame upload') {
+		const result = await uploadFilesViaApi(blobs, {
+			names,
+			targetUrl,
+			label,
+			detail: `${blobs.length} sampled frame${blobs.length === 1 ? '' : 's'}`
+		});
+		if (!Array.isArray(result.files)) throw new Error(result.message || 'Frame upload failed');
+		finishUploadProgress(
+			`${result.files.length} frame${result.files.length === 1 ? '' : 's'} saved`
+		);
 		return result.files;
 	}
 
@@ -585,12 +847,16 @@
 		if (detectFileType(file.name) === 'image') {
 			fileIds = [file.id];
 		} else {
-			const videoUrl = originalUrls[file.id];
-			if (!videoUrl) {
-				notify('Original video not available locally to sample; re-upload it from this device');
+			if (isDavFile(file)) {
+				notify('DAV files can be selected for YOLO; convert to MP4 before using SAM sampling');
 				return;
 			}
 			try {
+				if (!originalUrls[file.id]) {
+					modelState = 'Loading source video';
+					notify('Loading source video from backend');
+				}
+				const videoUrl = await ensureOriginalUrl(file);
 				notify(`Sampling video at ${samFps} fps…`);
 				const frames = await sampleVideoFrames(
 					videoUrl,
@@ -623,7 +889,12 @@
 						const shardBlobs = indices.map((idx) => blobs[idx]);
 						const shardNames = indices.map((idx) => names[idx]);
 						modelState = `Uploading shard ${i + 1}/${shards.length} to ${w.name}`;
-						const uploaded = await uploadBlobs(shardBlobs, shardNames, w.http_url);
+						const uploaded = await uploadBlobs(
+							shardBlobs,
+							shardNames,
+							w.http_url,
+							`Frame upload ${i + 1}/${shards.length}`
+						);
 						const ids = uploaded.map((u) => u.id);
 						ids.forEach((id, k) => (urls[id] = URL.createObjectURL(shardBlobs[k])));
 						assignments.push({
@@ -646,12 +917,13 @@
 
 				// No fleet workers selected — upload everything to the single backend.
 				notify(`Uploading ${frames.length} sampled frames…`);
-				const uploaded = await uploadBlobs(blobs, names);
+				const uploaded = await uploadBlobs(blobs, names, backendUrl, 'Sampled frame upload');
 				fileIds = uploaded.map((u) => u.id);
 				const urls = {};
 				uploaded.forEach((u, i) => (urls[u.id] = URL.createObjectURL(blobs[i])));
 				originalUrls = { ...originalUrls, ...urls };
 			} catch (error) {
+				if (uploadProgress.active) failUploadProgress(error?.message || 'Frame upload failed');
 				notify(error?.message || 'Video sampling failed');
 				return;
 			}
@@ -852,7 +1124,12 @@
 								const [x1, y1, x2, y2] = boxes[mi];
 								entry.polygons.push({
 									classId,
-									points: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+									points: [
+										[x1, y1],
+										[x2, y1],
+										[x2, y2],
+										[x1, y2]
+									]
 								});
 							}
 						});
@@ -861,7 +1138,12 @@
 						for (const b of boxes) {
 							entry.polygons.push({
 								classId,
-								points: [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+								points: [
+									[b[0], b[1]],
+									[b[2], b[1]],
+									[b[2], b[3]],
+									[b[0], b[3]]
+								]
 							});
 						}
 					}
@@ -902,9 +1184,17 @@
 			link.click();
 			URL.revokeObjectURL(link.href);
 
-			datasetStats = { frameCount, labeledFrames, boxesTotal, classes: classes.length, format: exportFormat };
+			datasetStats = {
+				frameCount,
+				labeledFrames,
+				boxesTotal,
+				classes: classes.length,
+				format: exportFormat
+			};
 			const unit = segment ? 'polygons' : 'boxes';
-			notify(`Dataset exported: ${frameCount} frames, ${boxesTotal} ${unit}, ${classes.length} classes`);
+			notify(
+				`Dataset exported: ${frameCount} frames, ${boxesTotal} ${unit}, ${classes.length} classes`
+			);
 		} catch (error) {
 			notify(error?.message || 'Dataset export failed');
 		} finally {
@@ -952,12 +1242,19 @@
 		} catch {
 			savedDatasets = [];
 		}
+		if (restoreFleetSession()) {
+			saveFleetSession();
+			startFleetPolling();
+		} else {
+			createFleetRoom({ auto: true });
+		}
 		connectBackend();
 	});
 
 	onDestroy(() => {
 		socket?.close?.();
 		stopFleetPolling();
+		clearTimeout(uploadProgressTimer);
 	});
 
 	function saveBackendUrl() {
@@ -995,55 +1292,6 @@
 		notify('Backend URL copied');
 	}
 
-	function shellQuote(value) {
-		return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
-	}
-
-	function kaggleNotebookUrl() {
-		const ref = kaggleNotebookRef.trim() || defaultKaggleNotebookRef;
-		return `https://www.kaggle.com/code/${ref}/edit`;
-	}
-
-	function kaggleBootstrapCode() {
-		const notebookName = kaggleNotebookName.trim() || 'kaggle-traffic-gpu';
-		if (!kaggleRoomId.trim() || !kaggleRoomSecret.trim()) {
-			return [
-				'# Local terminal, from the backend project:',
-				'./create-room-tui',
-				'',
-				'# Then paste the generated room ID and secret into this Remotes tab.'
-			].join('\n');
-		}
-
-		return [
-			'# Kaggle notebook cell. Enable GPU + Internet before running.',
-			'!wget -q -O run.sh "https://raw.githubusercontent.com/sam2yolo/backend/refs/heads/main/run.sh"',
-			`!bash run.sh ${shellQuote(kaggleRoomId.trim())} ${shellQuote(
-				kaggleRoomSecret.trim()
-			)} ${shellQuote(notebookName)}`
-		].join('\n');
-	}
-
-	function copyKaggleBootstrap() {
-		navigator.clipboard?.writeText(kaggleBootstrapCode());
-		notify('Kaggle setup cell copied');
-	}
-
-	function openKaggleNotebook() {
-		window.open(kaggleNotebookUrl(), '_blank', 'noopener,noreferrer');
-	}
-
-	function connectKaggleTunnel() {
-		const url = kaggleTunnelUrl.trim().replace(/\/$/, '');
-		if (!/^https?:\/\//i.test(url)) {
-			notify('Paste the Kaggle tunnel URL, including http:// or https://');
-			return;
-		}
-		backendUrl = url;
-		saveBackendUrl();
-		notify('Connecting to Kaggle GPU backend');
-	}
-
 	function chooseLocalFiles() {
 		localFileInput?.click();
 	}
@@ -1057,7 +1305,7 @@
 			(file) =>
 				file.type.startsWith('video/') ||
 				file.type.startsWith('image/') ||
-				/\.(mp4|mov|m4v|webm|avi|mkv|jpe?g|png|webp|bmp)$/i.test(file.name)
+				mediaExtensionPattern.test(file.name)
 		);
 		event.currentTarget.value = '';
 		if (!files.length) {
@@ -1067,30 +1315,35 @@
 
 		uploadBusy = true;
 		try {
-			const body = new FormData();
-			for (const file of files) body.append('files', file);
-			body.append('backendUrl', backendUrl);
-			const response = await fetch('/api/uploads', { method: 'POST', body });
-			const result = await response.json();
-			if (!response.ok) throw new Error(result.message || 'Upload failed');
+			const result = await uploadFilesViaApi(files, {
+				label: 'Direct upload',
+				detail: `${files.length} local file${files.length === 1 ? '' : 's'}`
+			});
+			if (!Array.isArray(result.files)) throw new Error(result.message || 'Upload failed');
+			const records = result.files.map(normalizeBackendFile);
 			// Keep local object URLs so we can overlay SAM masks on images and
 			// sample frames from videos locally. result.files is returned in the
 			// same order we appended `files`.
 			const urls = {};
-			result.files.forEach((record, index) => {
+			records.forEach((record, index) => {
 				const source = files[index];
-				if (source && (source.type.startsWith('image/') || source.type.startsWith('video/'))) {
+				if (
+					source &&
+					!record.converted &&
+					(source.type.startsWith('image/') ||
+						source.type.startsWith('video/') ||
+						mediaExtensionPattern.test(source.name))
+				) {
 					urls[record.id] = URL.createObjectURL(source);
 				}
 			});
 			if (Object.keys(urls).length) originalUrls = { ...originalUrls, ...urls };
-			uploadedImports = [...result.files, ...uploadedImports];
-			selectedImportId ||= result.files.find(isMediaFile)?.id || '';
-			selectedTrainingAnchorId ||= result.files.find(isMediaFile)?.id || '';
-			notify(
-				`${result.files.length} file${result.files.length === 1 ? '' : 's'} uploaded to backend`
-			);
+			uploadedImports = [...records, ...uploadedImports];
+			reconcileAssetSelections({ preferredMediaId: records.find(isMediaFile)?.id || '' });
+			notify(`${records.length} file${records.length === 1 ? '' : 's'} uploaded to backend`);
+			finishUploadProgress(`${records.length} file${records.length === 1 ? '' : 's'} uploaded`);
 		} catch (error) {
+			failUploadProgress(error instanceof Error ? error.message : 'Upload failed');
 			notify(error instanceof Error ? error.message : 'Upload failed');
 		} finally {
 			uploadBusy = false;
@@ -1105,21 +1358,24 @@
 
 		uploadBusy = true;
 		try {
-			const body = new FormData();
-			for (const file of files) body.append('files', file);
-			body.append('backendUrl', backendUrl);
-			const response = await fetch('/api/uploads', { method: 'POST', body });
-			const result = await response.json();
-			if (!response.ok) throw new Error(result.message || 'Upload failed');
-			uploadedImports = [...result.files, ...uploadedImports];
-			selectedImportId ||= result.files.find(isMediaFile)?.id || '';
-			selectedDatasetId ||= result.files[0]?.id || '';
-			selectedTrainingAnchorId ||= result.files.find(isMediaFile)?.id || '';
-			notify(
-				`${result.files.length} ${successLabel}${result.files.length === 1 ? '' : 's'} uploaded`
+			const result = await uploadFilesViaApi(files, {
+				label: `${successLabel[0]?.toUpperCase() || 'F'}${successLabel.slice(1)} upload`,
+				detail: `${files.length} ${successLabel}${files.length === 1 ? '' : 's'} selected`
+			});
+			if (!Array.isArray(result.files)) throw new Error(result.message || 'Upload failed');
+			const records = result.files.map(normalizeBackendFile);
+			uploadedImports = [...records, ...uploadedImports];
+			reconcileAssetSelections({
+				preferredMediaId: records.find(isMediaFile)?.id || '',
+				preferredDatasetId: records[0]?.id || ''
+			});
+			notify(`${records.length} ${successLabel}${records.length === 1 ? '' : 's'} uploaded`);
+			finishUploadProgress(
+				`${records.length} ${successLabel}${records.length === 1 ? '' : 's'} uploaded`
 			);
-			return result.files;
+			return records;
 		} catch (error) {
+			failUploadProgress(error instanceof Error ? error.message : 'Upload failed');
 			notify(error instanceof Error ? error.message : 'Upload failed');
 			return [];
 		} finally {
@@ -1144,6 +1400,7 @@
 		}
 		if (send('download_file_google_drive', { url: googleDriveUrl.trim() })) {
 			uploadBusy = true;
+			startUploadProgress('drive', 'Google Drive download', 'Waiting for backend');
 			notify('Backend download started');
 		}
 	}
@@ -1155,6 +1412,7 @@
 		}
 		if (send('download_file_google_drive', { url: googleDriveUrl.trim() })) {
 			uploadBusy = true;
+			startUploadProgress('drive', 'Google Drive dataset download', 'Waiting for backend');
 			notify('Backend dataset download started');
 		}
 	}
@@ -1166,6 +1424,7 @@
 		}
 		if (send('download_file_wget', { url: datasetDirectUrl.trim() })) {
 			uploadBusy = true;
+			startUploadProgress('direct-download', 'Direct URL download', 'Waiting for backend');
 			notify('Backend direct dataset download started');
 		}
 	}
@@ -1206,7 +1465,7 @@
 			return;
 		}
 		datasetPath = path;
-		selectedTrainingAnchorId ||= mediaAssets()[0]?.id || '';
+		reconcileAssetSelections();
 		setTab('Train');
 		notify('Dataset path sent to Train');
 	}
@@ -1269,7 +1528,7 @@
 		datasetPath = manifest.root_path || manifest.training_path || '';
 		mergeAssetIds = (manifest.assets || []).map((asset) => asset.id).filter(Boolean);
 		classMappings = manifest.mappings || [];
-		selectedTrainingAnchorId ||= mediaAssets()[0]?.id || '';
+		reconcileAssetSelections();
 		setTab('Train');
 		notify(`Loaded ${manifest.name} for training`);
 	}
@@ -1404,7 +1663,9 @@
 										<canvas use:drawResult={{ result: item.result, imgUrl: item.imgUrl }}></canvas>
 										<figcaption>
 											<span class="result-class">{item.className}</span>
-											<span class="result-badge" class:zero={!item.detections}>{item.detections}</span>
+											<span class="result-badge" class:zero={!item.detections}
+												>{item.detections}</span
+											>
 										</figcaption>
 									</figure>
 								{/each}
@@ -1412,10 +1673,8 @@
 						{/if}
 					{:else if activeTab === 'Remotes'}
 						<div class="section-title-row">
-							<h2>Remotes</h2>
-							<button class="cloud-button" aria-label="Copy remote setup code" onclick={copyCode}
-								>cloud</button
-							>
+							<h2>Remote Notebook</h2>
+							<span class="status-pill">{fleetBusy ? 'Creating room' : 'Single user room'}</span>
 						</div>
 
 						<div class="form-group">
@@ -1433,49 +1692,40 @@
 						<div class="remote-card fleet-card">
 							<div class="section-title-row">
 								<div>
-									<h3>Fleet — auto room</h3>
+									<h3>Notebook setup</h3>
 									<p>
-										Create a room here, then paste the generated command on each GPU
-										machine. Workers appear below as they come online.
+										Copy the cell into your notebook and keep it running. Reloading this page keeps
+										the same room.
 									</p>
 								</div>
-								<span class="status-pill"
-									>{fleetWorkers.length} worker{fleetWorkers.length === 1 ? '' : 's'} · {reachableWorkers.length}
-									reachable</span
-								>
+								<span class="status-pill">{reachableWorkers.length || 0} connected</span>
 							</div>
 
-							{#if !fleetRoomId}
-								<button
-									class="primary-action"
-									type="button"
-									disabled={fleetBusy}
-									onclick={createFleetRoom}
-								>
-									{fleetBusy ? 'Creating room…' : 'Create room'}
-								</button>
-							{:else}
-								<div class="settings-grid compact">
-									<label>Room ID <input readonly value={fleetRoomId} /></label>
-									<label>
-										Worker name (unique per machine)
-										<span class="input-action">
-											<input bind:value={fleetWorkerName} placeholder="nimble-sloth-9341" />
-											<button type="button" onclick={regenerateWorkerName}>↻</button>
-										</span>
-									</label>
-								</div>
-
+							{#if fleetBusy && !fleetRoomId}
+								<button class="primary-action" type="button" disabled> Creating room… </button>
+							{:else if fleetRoomId}
+								<label>
+									Worker name
+									<span class="input-action">
+										<input
+											bind:value={fleetWorkerName}
+											placeholder="nimble-sloth-9341"
+											onchange={saveFleetSession}
+										/>
+										<button type="button" onclick={regenerateWorkerName}>↻</button>
+									</span>
+								</label>
 								<label class="code-label">
-									Paste on each GPU machine — current name: <strong class="mono"
-										>{fleetWorkerName}</strong
-									>
+									Terminal command
 									<textarea readonly value={fleetCommand()}></textarea>
 								</label>
 
 								<div class="remote-actions">
+									<button class="ghost-button" type="button" onclick={copyFleetNotebookCell}
+										>Copy notebook cell</button
+									>
 									<button class="ghost-button" type="button" onclick={copyFleetCommand}
-										>Copy command</button
+										>Copy terminal command</button
 									>
 									<button class="ghost-button" type="button" onclick={regenerateWorkerName}
 										>New name</button
@@ -1485,9 +1735,13 @@
 									>
 								</div>
 								<small class="fleet-hint"
-									>Copying generates a fresh name for the next machine. Room ID/secret stay the
-									same.</small
+									>The notebook-cell button runs this terminal command through a Python
+									pseudo-terminal.</small
 								>
+							{:else}
+								<button class="primary-action" type="button" onclick={() => createFleetRoom()}>
+									Create room
+								</button>
 							{/if}
 
 							{#if fleetError}
@@ -1495,12 +1749,6 @@
 							{/if}
 
 							{#if fleetWorkers.length}
-								<small class="fleet-distribute">
-									Will distribute across {selectedWorkers.length} worker{selectedWorkers.length ===
-									1
-										? ''
-										: 's'}
-								</small>
 								<div class="remote-list">
 									{#each fleetWorkers as worker (worker.tunnel_id)}
 										{@const reachable = isWorkerReachable(worker)}
@@ -1515,118 +1763,10 @@
 											<span class="status-dot" class:online={reachable}></span>
 											<strong class="mono">{worker.name}</strong>
 											<span>{reachable ? 'Reachable' : worker.status || 'Unreachable'}</span>
-											<small class="mono">:{worker.remote_port}</small>
-											<small class="mono ws">{worker.ws_url}</small>
 											<button type="button" onclick={() => connectToWorker(worker)}>Connect</button>
 										</div>
 									{/each}
 								</div>
-							{/if}
-						</div>
-
-						<div class="remote-card kaggle-card">
-							<div class="section-title-row">
-								<div>
-									<h3>Kaggle online GPU</h3>
-									<p>
-										Run this backend in your existing Kaggle notebook, expose port 8000 through the
-										repo tunnel, then connect the website to that public URL.
-									</p>
-								</div>
-								<span class="status-pill">GPU remote</span>
-							</div>
-
-							<div class="kaggle-steps">
-								{#each kaggleSetupSteps as step, index (`kaggle-step-${index}`)}
-									<div>
-										<strong>{index + 1}</strong>
-										<span>{step}</span>
-									</div>
-								{/each}
-							</div>
-
-							<div class="settings-grid compact">
-								<label
-									>Existing Notebook
-									<input
-										bind:value={kaggleNotebookRef}
-										placeholder="username/notebook-slug"
-									/></label
-								>
-								<label
-									>Room ID <input
-										bind:value={kaggleRoomId}
-										placeholder="from create-room-tui"
-									/></label
-								>
-								<label
-									>Room Secret
-									<input bind:value={kaggleRoomSecret} placeholder="from create-room-tui" /></label
-								>
-								<label
-									>Notebook Name <input
-										bind:value={kaggleNotebookName}
-										placeholder="traffic-gpu"
-									/></label
-								>
-								<label
-									>Kaggle Tunnel URL
-									<input
-										bind:value={kaggleTunnelUrl}
-										placeholder="http://163.61.236.112:20000"
-									/></label
-								>
-							</div>
-
-							<label class="code-label"
-								>Kaggle notebook cell
-								<textarea readonly value={kaggleBootstrapCode()}></textarea>
-							</label>
-
-							<div class="remote-actions">
-								<button class="ghost-button" type="button" onclick={openKaggleNotebook}
-									>Open Notebook</button
-								>
-								<button class="ghost-button" type="button" onclick={copyKaggleBootstrap}
-									>Copy Kaggle Cell</button
-								>
-								<button class="primary-action" type="button" onclick={connectKaggleTunnel}
-									>Use Kaggle GPU</button
-								>
-							</div>
-						</div>
-
-						<div class="remote-list">
-							<div class="remote-row">
-								<span></span>
-								<strong>{backendUrl || 'Backend'}</strong>
-								<span>Status: {connectionState}</span>
-								<small>WebSocket: /ws</small>
-								<button type="button" aria-label="Reconnect backend" onclick={connectBackend}
-									>sync</button
-								>
-							</div>
-							<div class="remote-row">
-								<span></span>
-								<strong>YOLO</strong>
-								<span>{modelReady ? 'Ready' : modelState}</span>
-								<small>Variant: {modelVariant}</small>
-								<button type="button" aria-label="Initialize YOLO model" onclick={initializeModel}
-									>load</button
-								>
-							</div>
-							{#if remotes.length}
-								{#each remotes as model, index (`${model.name || model}-${index}`)}
-									<div class="remote-row">
-										<span></span>
-										<strong>{model.name || model}</strong>
-										<span>{model.status || 'Available'}</span>
-										<small>{model.variant || model.type || 'Backend model'}</small>
-										<button type="button" aria-label="Copy backend URL" onclick={copyCode}
-											>copy</button
-										>
-									</div>
-								{/each}
 							{/if}
 						</div>
 					{:else if activeTab === 'Import'}
@@ -1644,12 +1784,12 @@
 							{#if importMode === 'upload'}
 								<div class="upload-card">
 									<p>Upload images or video<br />from local device</p>
-									<span>JPG, PNG · MP4, MOV, WEBM, AVI, MKV</span>
+									<span>JPG, PNG · MP4, MOV, WEBM, AVI, MKV, DAV</span>
 									<input
 										bind:this={localFileInput}
 										class="hidden-file-input"
 										type="file"
-										accept="image/*,video/*,.jpg,.jpeg,.png,.webp,.bmp,.mp4,.mov,.m4v,.webm,.avi,.mkv"
+										accept={localMediaAccept}
 										multiple
 										onchange={handleLocalFileChange}
 									/>
@@ -1667,6 +1807,25 @@
 											{uploadBusy ? 'Uploading...' : 'Upload'}
 										</button>
 									</div>
+								</div>
+							{/if}
+							{#if uploadProgress.visible}
+								<div class="upload-progress" aria-live="polite">
+									<div class="upload-progress-head">
+										<strong>{uploadProgress.label}</strong>
+										<span>{uploadProgress.value}%</span>
+									</div>
+									<div
+										class="progress-track upload-progress-track"
+										role="progressbar"
+										aria-valuemin="0"
+										aria-valuemax="100"
+										aria-valuenow={uploadProgress.value}
+										aria-label={`${uploadProgress.label} progress`}
+									>
+										<span style={`width: ${uploadProgress.value}%`}></span>
+									</div>
+									<small>{uploadProgress.detail}</small>
 								</div>
 							{/if}
 						</div>
@@ -1714,8 +1873,7 @@
 										>Max frames (0 = all)
 										<input type="number" bind:value={samMaxFrames} min="0" step="1" /></label
 									>
-									<label
-										>Batch <input type="number" bind:value={samBatch} min="1" step="1" /></label
+									<label>Batch <input type="number" bind:value={samBatch} min="1" step="1" /></label
 									>
 								</div>
 								<small class="fleet-distribute">
@@ -1755,15 +1913,15 @@
 												{/each}
 											</select>
 											<button
-											disabled={!selectedPromptType}
-											onclick={() => {
-												if (selectedPromptType && !promptTags.includes(selectedPromptType)) {
-													promptTags = [...promptTags, selectedPromptType];
-												}
-												selectedPromptType = '';
-											}}>Add</button
-										>
-									</div>
+												disabled={!selectedPromptType}
+												onclick={() => {
+													if (selectedPromptType && !promptTags.includes(selectedPromptType)) {
+														promptTags = [...promptTags, selectedPromptType];
+													}
+													selectedPromptType = '';
+												}}>Add</button
+											>
+										</div>
 									{/if}
 									{#if promptTags.length}
 										<div class="chips">
@@ -1932,7 +2090,7 @@
 										bind:this={datasetFileInput}
 										class="hidden-file-input"
 										type="file"
-										accept=".zip,.yaml,.yml,.txt,.json,.csv,image/*,video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv"
+										accept={datasetAccept}
 										multiple
 										onchange={handleDatasetFileChange}
 									/>
@@ -1967,6 +2125,25 @@
 										>
 											{uploadBusy ? 'Downloading...' : 'Download URL'}
 										</button>
+									</div>
+								{/if}
+								{#if uploadProgress.visible}
+									<div class="upload-progress compact" aria-live="polite">
+										<div class="upload-progress-head">
+											<strong>{uploadProgress.label}</strong>
+											<span>{uploadProgress.value}%</span>
+										</div>
+										<div
+											class="progress-track upload-progress-track"
+											role="progressbar"
+											aria-valuemin="0"
+											aria-valuemax="100"
+											aria-valuenow={uploadProgress.value}
+											aria-label={`${uploadProgress.label} progress`}
+										>
+											<span style={`width: ${uploadProgress.value}%`}></span>
+										</div>
+										<small>{uploadProgress.detail}</small>
 									</div>
 								{/if}
 							</section>
@@ -2229,8 +2406,8 @@
 								<div>
 									<h3>Compile YOLO dataset</h3>
 									<p>
-										Turn the streamed SAM results into a YOLO-compatible dataset (images +
-										labels + data.yaml). Each prompt becomes a class.
+										Turn the streamed SAM results into a YOLO-compatible dataset (images + labels +
+										data.yaml). Each prompt becomes a class.
 									</p>
 								</div>
 								<span class="status-pill">{liveResults.length} frames</span>
@@ -2256,7 +2433,12 @@
 								</small>
 							</div>
 							<div class="settings-grid compact">
-								<label>Dataset name <input bind:value={datasetManifestName} placeholder="sam-dataset" /></label>
+								<label
+									>Dataset name <input
+										bind:value={datasetManifestName}
+										placeholder="sam-dataset"
+									/></label
+								>
 								<div class="dataset-classes">
 									<span class="field-label">Classes</span>
 									<div class="chips">
@@ -2687,13 +2869,6 @@
 		box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04);
 	}
 
-	.kaggle-card p {
-		margin: 5px 0 0;
-		max-width: 680px;
-		color: #555;
-		line-height: 1.55;
-	}
-
 	.eyebrow {
 		display: inline-block;
 		margin-bottom: 4px;
@@ -2749,10 +2924,6 @@
 
 	.mono {
 		font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-	}
-
-	.worker-row .ws {
-		opacity: 0.7;
 	}
 
 	.worker-row input[type='checkbox'] {
@@ -2852,38 +3023,6 @@
 		color: #8b949e;
 	}
 
-	.kaggle-steps {
-		display: grid;
-		grid-template-columns: repeat(2, minmax(0, 1fr));
-		gap: 10px;
-	}
-
-	.kaggle-steps div {
-		display: grid;
-		grid-template-columns: 28px 1fr;
-		align-items: start;
-		gap: 10px;
-		border-radius: 6px;
-		background: #f5f5f5;
-		padding: 10px;
-	}
-
-	.kaggle-steps strong {
-		display: grid;
-		place-items: center;
-		width: 24px;
-		height: 24px;
-		border-radius: 50%;
-		background: #d86f32;
-		color: #fff;
-		font-size: 0.72rem;
-	}
-
-	.kaggle-steps span {
-		font-size: 0.78rem;
-		line-height: 1.4;
-	}
-
 	.code-label {
 		gap: 8px;
 	}
@@ -2928,6 +3067,42 @@
 		display: block;
 		height: 100%;
 		background: #d86f32;
+	}
+
+	.upload-progress {
+		width: min(520px, 100%);
+		display: grid;
+		gap: 8px;
+		color: #555;
+	}
+
+	.upload-progress.compact {
+		margin-top: 16px;
+		width: 100%;
+	}
+
+	.upload-progress-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		font-size: 0.82rem;
+	}
+
+	.upload-progress-head strong,
+	.upload-progress-head span {
+		color: #2f2f2f;
+	}
+
+	.upload-progress-track {
+		width: 100%;
+		height: 12px;
+	}
+
+	.upload-progress small {
+		color: #7a7a7a;
+		font-size: 0.75rem;
+		overflow-wrap: anywhere;
 	}
 
 	.remote-row {
