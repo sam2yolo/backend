@@ -27,6 +27,20 @@ async function broker(path, options = {}) {
 	return data;
 }
 
+async function probe(url) {
+	// The broker's is_alive flag is unreliable, so we check the worker's HTTP
+	// endpoint directly. Any response (even non-200) means it's reachable.
+	try {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 3500);
+		const response = await fetch(`${url}/`, { signal: controller.signal });
+		clearTimeout(timer);
+		return response.status > 0;
+	} catch {
+		return false;
+	}
+}
+
 function shapeWorker(tunnel) {
 	// tunnel.name looks like "nimble-sloth-9341-8000" (worker name + local port)
 	const name = String(tunnel.name || '').replace(/-(\d+)$/, '');
@@ -59,9 +73,16 @@ export async function POST({ request }) {
 		if (op === 'list_workers') {
 			if (!body.room_id) return json({ message: 'room_id is required' }, { status: 400 });
 			const data = await broker(`/rooms/${encodeURIComponent(body.room_id)}/tunnels`);
+			const workers = (data.tunnels || []).map(shapeWorker);
+			// Probe each worker concurrently; broker's is_alive is unreliable.
+			await Promise.all(
+				workers.map(async (w) => {
+					w.reachable = await probe(w.http_url);
+				})
+			);
 			return json({
 				room_id: data.room_id,
-				workers: (data.tunnels || []).map(shapeWorker)
+				workers
 			});
 		}
 

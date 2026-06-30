@@ -2,7 +2,11 @@
 	import { resolve } from '$app/paths';
 	import { onDestroy, onMount } from 'svelte';
 	import { createRoom, listWorkers, randomWorkerName, bootstrapCommand } from '$lib/broker';
-	import { renderResult } from '$lib/sammask';
+	import { renderResult, decodeMask } from '$lib/sammask';
+	import { buildYoloDataset } from '$lib/dataset';
+	import { maskToPolygons } from '$lib/contours';
+	import { sampleVideoFrames } from '$lib/videoframes';
+	import { distributeSam, shardIndices } from '$lib/samrun';
 
 	const tabs = [
 		'Overview',
@@ -53,6 +57,8 @@
 	let samBaseUrl = $state('http://127.0.0.1:8001');
 	let newPromptText = $state('');
 	let samBatch = $state(4);
+	let samFps = $state(2); // frames/sec to sample from video for SAM
+	let samMaxFrames = $state(40); // cap sampled frames (0 = all)
 	let kaggleNotebookRef = $state(defaultKaggleNotebookRef);
 	let kaggleRoomId = $state('');
 	let kaggleRoomSecret = $state('');
@@ -63,10 +69,27 @@
 	let fleetRoomId = $state('');
 	let fleetRoomSecret = $state('');
 	let fleetWorkerName = $state('');
-	let fleetWorkers = $state([]); // [{ tunnel_id, name, remote_port, http_url, ws_url, alive, status }]
+	let fleetWorkers = $state([]); // [{ tunnel_id, name, remote_port, http_url, ws_url, alive, reachable, status }]
 	let fleetBusy = $state(false);
 	let fleetError = $state('');
 	let fleetPollTimer = null;
+	// tunnel_ids the user has explicitly excluded from runs (default: all included).
+	let excludedWorkerIds = $state([]);
+
+	// A worker is usable if reachable (fall back to alive for back-compat).
+	const isWorkerReachable = (w) => (w.reachable === undefined ? !!w.alive : !!w.reachable);
+	const reachableWorkers = $derived(fleetWorkers.filter(isWorkerReachable));
+	// Selected = reachable AND not excluded; these fan out across a SAM run.
+	const selectedWorkers = $derived(
+		reachableWorkers.filter((w) => w.ws_url && !excludedWorkerIds.includes(w.tunnel_id))
+	);
+
+	function toggleWorker(worker) {
+		const id = worker.tunnel_id;
+		excludedWorkerIds = excludedWorkerIds.includes(id)
+			? excludedWorkerIds.filter((x) => x !== id)
+			: [...excludedWorkerIds, id];
+	}
 
 	let uploadedImports = $state([]);
 	let selectedImportId = $state('');
@@ -113,6 +136,9 @@
 	let originalUrls = $state({}); // file_id -> object URL (for overlay backgrounds)
 	let liveResults = $state([]); // [{ key, taskId, className, frameIndex, result, imgUrl, detections }]
 	let totalDetections = $state(0);
+	let exportingDataset = $state(false);
+	let datasetStats = $state(null);
+	let exportFormat = $state('detect'); // 'detect' | 'segment'
 
 	function defaultBackendUrl() {
 		return `${location.protocol}//${location.hostname}:8000`;
@@ -211,7 +237,10 @@
 		const command = fleetCommand();
 		if (!command) return;
 		navigator.clipboard?.writeText(command);
-		notify('Bootstrap command copied');
+		// Each machine in the room needs a unique name; roll a fresh one so the
+		// next copy targets a new worker (room_id/secret stay stable).
+		fleetWorkerName = randomWorkerName();
+		notify('Command copied · new worker name generated for the next machine');
 	}
 
 	function connectToWorker(worker) {
@@ -531,31 +560,195 @@
 		});
 	}
 
+	// Upload an array of Blobs (e.g. sampled video frames) as images; returns the
+	// backend file records (in order).
+	async function uploadBlobs(blobs, names, targetUrl = backendUrl) {
+		const body = new FormData();
+		blobs.forEach((blob, i) => body.append('files', blob, names[i]));
+		body.append('backendUrl', targetUrl);
+		const response = await fetch('/api/uploads', { method: 'POST', body });
+		const result = await response.json();
+		if (!response.ok) throw new Error(result.message || 'Frame upload failed');
+		return result.files;
+	}
+
 	// SAM 3.1: image-only, one task per text prompt. Each prompt becomes a class
-	// in the compiled dataset (prompt index = class id).
-	function startSamInference(file) {
+	// in the compiled dataset (prompt index = class id). Videos are sampled into
+	// frames in the browser first.
+	async function startSamInference(file) {
 		if (!promptTags.length) {
 			notify('Add at least one text prompt for SAM');
 			return;
 		}
-		if (detectFileType(file.name) !== 'image') {
-			notify('SAM needs images. Pick image imports (video frame sampling is coming next).');
-			return;
+
+		let fileIds;
+		if (detectFileType(file.name) === 'image') {
+			fileIds = [file.id];
+		} else {
+			const videoUrl = originalUrls[file.id];
+			if (!videoUrl) {
+				notify('Original video not available locally to sample; re-upload it from this device');
+				return;
+			}
+			try {
+				notify(`Sampling video at ${samFps} fps…`);
+				const frames = await sampleVideoFrames(
+					videoUrl,
+					Number(samFps),
+					Number(samMaxFrames) || 0,
+					(done, total) => (modelState = `Sampling ${done}/${total}`)
+				);
+				if (!frames.length) {
+					notify('No frames sampled from video');
+					return;
+				}
+				const blobs = frames.map((f) => f.blob);
+				const names = frames.map((_, i) => `${file.name}-f${String(i).padStart(5, '0')}.jpg`);
+
+				// Files live on the worker they're uploaded to (each worker is its own
+				// backend), so shard frame indices first and upload each shard to its
+				// own worker; build per-worker assignments for distribution.
+				const pool = selectedWorkers
+					.filter((w) => w.http_url && w.ws_url)
+					.map((w) => ({ name: w.name, http_url: w.http_url, ws_url: w.ws_url }));
+
+				if (pool.length) {
+					const shards = shardIndices(frames.length, pool.length);
+					notify(`Uploading ${frames.length} frames across ${shards.length} worker(s)…`);
+					const assignments = [];
+					const urls = {};
+					for (let i = 0; i < shards.length; i++) {
+						const indices = shards[i];
+						const w = pool[i];
+						const shardBlobs = indices.map((idx) => blobs[idx]);
+						const shardNames = indices.map((idx) => names[idx]);
+						modelState = `Uploading shard ${i + 1}/${shards.length} to ${w.name}`;
+						const uploaded = await uploadBlobs(shardBlobs, shardNames, w.http_url);
+						const ids = uploaded.map((u) => u.id);
+						ids.forEach((id, k) => (urls[id] = URL.createObjectURL(shardBlobs[k])));
+						assignments.push({
+							name: w.name,
+							ws_url: w.ws_url,
+							fileIds: ids,
+							globalIndices: indices
+						});
+					}
+					originalUrls = { ...originalUrls, ...urls };
+					liveResults = [];
+					totalDetections = 0;
+					runDistributedSam(
+						assignments.map((a) => ({ name: a.name, ws_url: a.ws_url })),
+						null,
+						{ assignments, totalFrames: frames.length }
+					);
+					return;
+				}
+
+				// No fleet workers selected — upload everything to the single backend.
+				notify(`Uploading ${frames.length} sampled frames…`);
+				const uploaded = await uploadBlobs(blobs, names);
+				fileIds = uploaded.map((u) => u.id);
+				const urls = {};
+				uploaded.forEach((u, i) => (urls[u.id] = URL.createObjectURL(blobs[i])));
+				originalUrls = { ...originalUrls, ...urls };
+			} catch (error) {
+				notify(error?.message || 'Video sampling failed');
+				return;
+			}
 		}
-		const fileIds = [file.id];
-		const tasks = promptTags.map((prompt, classId) => ({
-			name: `SAM · ${prompt}`,
-			file_ids: fileIds,
-			file_type: 'image',
-			text_prompt: prompt,
-			conf: Number(confidence),
-			batch: Number(samBatch),
-			class_id: classId,
-			class_name: prompt
-		}));
+
+		// Single-backend run: a still image, or a video with no fleet workers
+		// selected. The file already lives on backendUrl, so run it there.
+		const backendWorker = {
+			name: backendUrl,
+			ws_url: backendUrl.replace(/^http/, 'ws').replace(/\/$/, '') + '/ws'
+		};
 		liveResults = [];
 		totalDetections = 0;
-		ensureModel('sam', tasks);
+		runDistributedSam([backendWorker], fileIds);
+	}
+
+	// Orchestrate a distributed SAM run across workers and stream results into the
+	// live view + a task-project row. The global socket is freed during the run
+	// (each worker allows a single WebSocket) and reconnected afterwards.
+	function runDistributedSam(workers, fileIds, extra = {}) {
+		const { assignments = null, totalFrames = null } = extra;
+		const prompts = promptTags.slice();
+		const frameCount = assignments
+			? (totalFrames ?? assignments.reduce((n, a) => n + a.fileIds.length, 0))
+			: fileIds.length;
+		const workerCount = assignments ? assignments.length : workers.length;
+		const totalUnits = frameCount * prompts.length;
+		let doneUnits = 0;
+		const jobId = 'sam-' + Date.now().toString(36);
+		upsertTask(jobId, {
+			name: `SAM · ${prompts.join(', ')}`,
+			status: `Running on ${workerCount} worker${workerCount === 1 ? '' : 's'}`,
+			progress: 0,
+			type: 'inference'
+		});
+
+		const hadSocket = socket && socket.readyState === WebSocket.OPEN;
+		socket?.close?.();
+		connectionState = 'Running SAM';
+
+		let job;
+		try {
+			job = distributeSam(workers, {
+				fileIds,
+				assignments,
+				prompts,
+				samBaseUrl,
+				conf: Number(confidence),
+				batch: Number(samBatch),
+				onEvent: (e) => {
+					if (e.type === 'status') {
+						modelState = `${e.worker}: ${e.message}`;
+					} else if (e.type === 'frame') {
+						const detections = (e.result.masks || []).length;
+						totalDetections += detections;
+						doneUnits += 1;
+						upsertTask(jobId, {
+							progress: Math.round((doneUnits / Math.max(1, totalUnits)) * 100),
+							status: `Running · ${doneUnits}/${totalUnits}`
+						});
+						liveResults = [
+							{
+								key: `${e.taskId}-${e.frameIndex}-${e.className}`,
+								taskId: e.taskId,
+								className: e.className || 'objects',
+								frameIndex: e.frameIndex,
+								result: e.result,
+								imgUrl: e.fileId ? originalUrls[e.fileId] : null,
+								detections
+							},
+							...liveResults
+						].slice(0, 300);
+					} else if (e.type === 'error') {
+						notify(`${e.worker}: ${e.message}`);
+					}
+				}
+			});
+		} catch (error) {
+			upsertTask(jobId, { status: 'Failed' });
+			notify(error?.message || 'Could not start SAM run');
+			if (hadSocket) connectBackend();
+			return;
+		}
+
+		job.promise
+			.then(() => {
+				upsertTask(jobId, { status: 'Completed', progress: 100 });
+				modelState = 'SAM complete';
+				notify('SAM inference complete');
+			})
+			.catch((error) => {
+				upsertTask(jobId, { status: 'Failed' });
+				notify(error?.message || 'SAM run failed');
+			})
+			.finally(() => {
+				if (hadSocket) connectBackend();
+			});
 	}
 
 	// Turn a fetched SAM chunk into renderable live-result tiles.
@@ -599,6 +792,124 @@
 		}
 		paint(params);
 		return { update: paint };
+	}
+
+	// Compile the streamed SAM results into a YOLO-compatible dataset zip.
+	// Each prompt is a class; boxes become YOLO detection labels.
+	async function exportYoloDataset() {
+		if (!liveResults.length) {
+			notify('Run SAM inference first to generate results');
+			return;
+		}
+		const classes = promptTags.slice();
+		if (!classes.length) {
+			notify('No prompt classes available to label');
+			return;
+		}
+		exportingDataset = true;
+		const segment = exportFormat === 'segment';
+		try {
+			// Group all per-prompt results by source frame.
+			const byFrame = new Map();
+			for (const item of liveResults) {
+				const f = item.frameIndex;
+				if (!byFrame.has(f)) {
+					byFrame.set(f, {
+						name: `frame_${String(f).padStart(6, '0')}`,
+						imgUrl: item.imgUrl,
+						width: item.result.width,
+						height: item.result.height,
+						boxes: [],
+						polygons: []
+					});
+				}
+				const entry = byFrame.get(f);
+				const classId = classes.indexOf(item.className);
+				if (classId < 0) continue;
+				const boxes = item.result.boxes || [];
+				for (const b of boxes) {
+					entry.boxes.push({ classId, x1: b[0], y1: b[1], x2: b[2], y2: b[3] });
+				}
+				if (segment) {
+					const masks = item.result.masks || [];
+					if (masks.length) {
+						masks.forEach((maskObj, mi) => {
+							let decoded;
+							try {
+								decoded = decodeMask(maskObj);
+							} catch {
+								decoded = null;
+							}
+							if (!decoded) return;
+							const polys = maskToPolygons(decoded.bits, decoded.w, decoded.h, {
+								minArea: 16,
+								simplifyTol: 1.5
+							});
+							if (polys.length) {
+								for (const p of polys) entry.polygons.push({ classId, points: p.points });
+							} else if (boxes[mi]) {
+								// Tracer found nothing usable — fall back to the box rectangle.
+								const [x1, y1, x2, y2] = boxes[mi];
+								entry.polygons.push({
+									classId,
+									points: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+								});
+							}
+						});
+					} else {
+						// No masks — fall back to each box as a 4-point polygon.
+						for (const b of boxes) {
+							entry.polygons.push({
+								classId,
+								points: [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+							});
+						}
+					}
+				}
+			}
+
+			const frames = [];
+			for (const entry of byFrame.values()) {
+				let imageBlob = null;
+				if (entry.imgUrl) {
+					try {
+						imageBlob = await (await fetch(entry.imgUrl)).blob();
+					} catch {
+						imageBlob = null;
+					}
+				}
+				frames.push({
+					name: entry.name,
+					imageBlob,
+					width: entry.width,
+					height: entry.height,
+					boxes: entry.boxes,
+					polygons: entry.polygons
+				});
+			}
+
+			const datasetName = datasetManifestName?.trim() || 'sam-dataset';
+			const { blob, frameCount, labeledFrames, boxesTotal } = await buildYoloDataset({
+				classes,
+				frames,
+				name: datasetName,
+				format: exportFormat
+			});
+
+			const link = document.createElement('a');
+			link.href = URL.createObjectURL(blob);
+			link.download = `${datasetName}.zip`;
+			link.click();
+			URL.revokeObjectURL(link.href);
+
+			datasetStats = { frameCount, labeledFrames, boxesTotal, classes: classes.length, format: exportFormat };
+			const unit = segment ? 'polygons' : 'boxes';
+			notify(`Dataset exported: ${frameCount} frames, ${boxesTotal} ${unit}, ${classes.length} classes`);
+		} catch (error) {
+			notify(error?.message || 'Dataset export failed');
+		} finally {
+			exportingDataset = false;
+		}
 	}
 
 	function startTraining() {
@@ -762,12 +1073,13 @@
 			const response = await fetch('/api/uploads', { method: 'POST', body });
 			const result = await response.json();
 			if (!response.ok) throw new Error(result.message || 'Upload failed');
-			// Keep local object URLs for images so we can overlay SAM masks on them.
-			// result.files is returned in the same order we appended `files`.
+			// Keep local object URLs so we can overlay SAM masks on images and
+			// sample frames from videos locally. result.files is returned in the
+			// same order we appended `files`.
 			const urls = {};
 			result.files.forEach((record, index) => {
 				const source = files[index];
-				if (source && source.type.startsWith('image/')) {
+				if (source && (source.type.startsWith('image/') || source.type.startsWith('video/'))) {
 					urls[record.id] = URL.createObjectURL(source);
 				}
 			});
@@ -1128,7 +1440,8 @@
 									</p>
 								</div>
 								<span class="status-pill"
-									>{fleetWorkers.length} worker{fleetWorkers.length === 1 ? '' : 's'}</span
+									>{fleetWorkers.length} worker{fleetWorkers.length === 1 ? '' : 's'} · {reachableWorkers.length}
+									reachable</span
 								>
 							</div>
 
@@ -1145,7 +1458,7 @@
 								<div class="settings-grid compact">
 									<label>Room ID <input readonly value={fleetRoomId} /></label>
 									<label>
-										Worker name
+										Worker name (unique per machine)
 										<span class="input-action">
 											<input bind:value={fleetWorkerName} placeholder="nimble-sloth-9341" />
 											<button type="button" onclick={regenerateWorkerName}>↻</button>
@@ -1154,7 +1467,9 @@
 								</div>
 
 								<label class="code-label">
-									Paste on each GPU machine
+									Paste on each GPU machine — current name: <strong class="mono"
+										>{fleetWorkerName}</strong
+									>
 									<textarea readonly value={fleetCommand()}></textarea>
 								</label>
 
@@ -1162,10 +1477,17 @@
 									<button class="ghost-button" type="button" onclick={copyFleetCommand}
 										>Copy command</button
 									>
+									<button class="ghost-button" type="button" onclick={regenerateWorkerName}
+										>New name</button
+									>
 									<button class="ghost-button" type="button" onclick={refreshFleetWorkers}
 										>Refresh workers</button
 									>
 								</div>
+								<small class="fleet-hint"
+									>Copying generates a fresh name for the next machine. Room ID/secret stay the
+									same.</small
+								>
 							{/if}
 
 							{#if fleetError}
@@ -1173,13 +1495,28 @@
 							{/if}
 
 							{#if fleetWorkers.length}
+								<small class="fleet-distribute">
+									Will distribute across {selectedWorkers.length} worker{selectedWorkers.length ===
+									1
+										? ''
+										: 's'}
+								</small>
 								<div class="remote-list">
 									{#each fleetWorkers as worker (worker.tunnel_id)}
-										<div class="remote-row">
-											<span class="status-dot" class:online={worker.alive}></span>
-											<strong>{worker.name}</strong>
-											<span>{worker.alive ? 'Online' : worker.status || 'Pending'}</span>
-											<small>{worker.http_url}</small>
+										{@const reachable = isWorkerReachable(worker)}
+										<div class="remote-row worker-row">
+											<input
+												type="checkbox"
+												aria-label={`Include ${worker.name}`}
+												disabled={!reachable}
+												checked={reachable && !excludedWorkerIds.includes(worker.tunnel_id)}
+												onchange={() => toggleWorker(worker)}
+											/>
+											<span class="status-dot" class:online={reachable}></span>
+											<strong class="mono">{worker.name}</strong>
+											<span>{reachable ? 'Reachable' : worker.status || 'Unreachable'}</span>
+											<small class="mono">:{worker.remote_port}</small>
+											<small class="mono ws">{worker.ws_url}</small>
 											<button type="button" onclick={() => connectToWorker(worker)}>Connect</button>
 										</div>
 									{/each}
@@ -1367,6 +1704,32 @@
 									? 'Text-prompted segmentation. Each prompt below becomes a dataset class.'
 									: 'COCO-class detection/segmentation. Prompts map to vehicle classes.'}
 							</small>
+							{#if inferenceModel === 'sam'}
+								<div class="settings-grid compact sam-params">
+									<label
+										>Video sample FPS
+										<input type="number" bind:value={samFps} min="0.5" step="0.5" /></label
+									>
+									<label
+										>Max frames (0 = all)
+										<input type="number" bind:value={samMaxFrames} min="0" step="1" /></label
+									>
+									<label
+										>Batch <input type="number" bind:value={samBatch} min="1" step="1" /></label
+									>
+								</div>
+								<small class="fleet-distribute">
+									{#if selectedWorkers.length}
+										Will distribute across {selectedWorkers.length} worker{selectedWorkers.length ===
+										1
+											? ''
+											: 's'} (manage in Remotes → Fleet)
+									{:else}
+										No fleet workers selected — will run on the single Backend URL. Add workers in
+										Remotes → Fleet.
+									{/if}
+								</small>
+							{/if}
 						</div>
 
 						<div class="split-grid">
@@ -1861,6 +2224,69 @@
 							onclick={startTraining}>Start</button
 						>
 					{:else if activeTab === 'Export'}
+						<div class="remote-card">
+							<div class="section-title-row">
+								<div>
+									<h3>Compile YOLO dataset</h3>
+									<p>
+										Turn the streamed SAM results into a YOLO-compatible dataset (images +
+										labels + data.yaml). Each prompt becomes a class.
+									</p>
+								</div>
+								<span class="status-pill">{liveResults.length} frames</span>
+							</div>
+							<div class="export-format">
+								<span class="field-label">Export format</span>
+								<div class="seg-control">
+									<button
+										class:active={exportFormat === 'detect'}
+										type="button"
+										onclick={() => (exportFormat = 'detect')}>Detection boxes</button
+									>
+									<button
+										class:active={exportFormat === 'segment'}
+										type="button"
+										onclick={() => (exportFormat = 'segment')}>Segmentation polygons</button
+									>
+								</div>
+								<small>
+									{exportFormat === 'segment'
+										? 'YOLO-seg labels: cls x1 y1 x2 y2 … from mask polygons (box fallback if no mask).'
+										: 'YOLO detection labels: cls cx cy w h from SAM boxes.'}
+								</small>
+							</div>
+							<div class="settings-grid compact">
+								<label>Dataset name <input bind:value={datasetManifestName} placeholder="sam-dataset" /></label>
+								<div class="dataset-classes">
+									<span class="field-label">Classes</span>
+									<div class="chips">
+										{#each promptTags as tag, i (tag)}
+											<span>{i}: {tag}</span>
+										{/each}
+										{#if !promptTags.length}<small>Add prompts in the Inference tab</small>{/if}
+									</div>
+								</div>
+							</div>
+							<div class="remote-actions">
+								<button
+									class="primary-action"
+									type="button"
+									disabled={exportingDataset || !liveResults.length || !promptTags.length}
+									onclick={exportYoloDataset}
+								>
+									{exportingDataset ? 'Compiling…' : 'Export dataset (.zip)'}
+								</button>
+							</div>
+							{#if datasetStats}
+								<small class="dataset-stat">
+									Last export ({datasetStats.format === 'segment' ? 'segment' : 'detect'}): {datasetStats.frameCount}
+									frames · {datasetStats.labeledFrames} labeled · {datasetStats.boxesTotal}
+									{datasetStats.format === 'segment' ? 'polygons' : 'boxes'} · {datasetStats.classes}
+									classes
+								</small>
+							{/if}
+						</div>
+
 						<div class="export-toolbar">
 							<input placeholder="Search" />
 							<select><option>All</option><option>Models</option><option>Datasets</option></select>
@@ -2309,8 +2735,42 @@
 		color: #f85149;
 	}
 
+	.fleet-distribute {
+		display: block;
+		margin: 8px 0;
+		color: #9fb6ff;
+	}
+
+	.fleet-hint {
+		display: block;
+		margin-top: 6px;
+		color: #8a8a8a;
+	}
+
+	.mono {
+		font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+	}
+
+	.worker-row .ws {
+		opacity: 0.7;
+	}
+
+	.worker-row input[type='checkbox'] {
+		accent-color: #3fb950;
+		width: auto;
+		margin: 0;
+	}
+
+	.export-format {
+		margin-bottom: 14px;
+	}
+
 	.model-switch {
 		margin-bottom: 18px;
+	}
+
+	.sam-params {
+		margin-top: 12px;
 	}
 
 	.seg-control {
@@ -2380,6 +2840,16 @@
 
 	.result-badge.zero {
 		background: #3a3a3a;
+	}
+
+	.dataset-classes .chips {
+		margin-top: 6px;
+	}
+
+	.dataset-stat {
+		display: block;
+		margin-top: 10px;
+		color: #8b949e;
 	}
 
 	.kaggle-steps {
