@@ -44,6 +44,7 @@
 	};
 	const datasetImportModes = ['upload', 'drive', 'direct'];
 	const fleetSessionStorageKey = 'samtoyoloFleetSession';
+	const localMirrorStorageKey = 'samtoyoloLocalMirrors';
 	const imageExtensionPattern = /\.(jpe?g|png|webp|bmp)$/i;
 	const videoExtensionPattern = /\.(mp4|mov|m4v|webm|avi|mkv|dav)$/i;
 	const mediaExtensionPattern = /\.(jpe?g|png|webp|bmp|mp4|mov|m4v|webm|avi|mkv|dav)$/i;
@@ -131,6 +132,8 @@
 	let frameKeepRate = $state(0.05);
 	let inferenceFeedback = $state('');
 	let inferenceFeedbackLevel = $state('info');
+	let inferenceLogs = $state([]);
+	let inferenceLogSeq = 0;
 
 	let datasetPath = $state('');
 	let datasetMode = $state('upload');
@@ -156,6 +159,7 @@
 
 	// Realtime results: original image URLs (by backend file_id) + streamed frames.
 	let originalUrls = $state({}); // file_id -> object URL (for overlay backgrounds)
+	let localMirrorRecords = $state({}); // file_id -> local mirror metadata served by website
 	let liveResults = $state([]); // [{ key, taskId, className, frameIndex, result, imgUrl, detections }]
 	let totalDetections = $state(0);
 	let storedResults = $state([]);
@@ -165,6 +169,10 @@
 	let exportingDataset = $state(false);
 	let datasetStats = $state(null);
 	let exportFormat = $state('detect'); // 'detect' | 'segment'
+	let datasetResultTaskId = $state('latest');
+	let datasetValidationPercent = $state(20);
+	const localMirrorPromisesByFile = new Map();
+	let remoteMirrorQueue = [];
 
 	function defaultBackendUrl() {
 		return `${location.protocol}//${location.hostname}:8000`;
@@ -187,6 +195,169 @@
 		inferenceFeedback = String(message || '');
 		inferenceFeedbackLevel = level;
 		if (toastMessage && message) notify(message);
+	}
+
+	function compactLogDetail(detail = {}) {
+		try {
+			const json = JSON.stringify(detail, (key, value) => {
+				if (typeof value === 'number' && Number.isFinite(value)) {
+					return Math.round(value * 100) / 100;
+				}
+				return value;
+			});
+			if (!json || json === '{}') return '';
+			return json.length > 360 ? `${json.slice(0, 357)}...` : json;
+		} catch {
+			return String(detail);
+		}
+	}
+
+	function addInferenceLog(message, detail = {}, level = 'info') {
+		const entry = {
+			id: ++inferenceLogSeq,
+			time: new Date().toLocaleTimeString(),
+			level,
+			message: String(message || ''),
+			detail: compactLogDetail(detail)
+		};
+		inferenceLogs = [entry, ...inferenceLogs].slice(0, 80);
+		console.debug(`[samtoyolo:${level}] ${entry.message}`, detail);
+	}
+
+	function clearInferenceLogs() {
+		inferenceLogs = [];
+	}
+
+	function localMirrorUrl(cacheId) {
+		const params = new URLSearchParams({ id: cacheId });
+		return `${resolve('/api/local-mirror')}?${params.toString()}`;
+	}
+
+	function loadLocalMirrorRecords() {
+		try {
+			const raw = localStorage.getItem(localMirrorStorageKey);
+			if (raw) localMirrorRecords = JSON.parse(raw) || {};
+		} catch {
+			localMirrorRecords = {};
+			localStorage.removeItem(localMirrorStorageKey);
+		}
+	}
+
+	function saveLocalMirrorRecords() {
+		localStorage.setItem(localMirrorStorageKey, JSON.stringify(localMirrorRecords));
+	}
+
+	function rememberLocalMirror(fileId, mirror = {}) {
+		if (!fileId || !mirror?.cacheId) return;
+		localMirrorRecords = {
+			...localMirrorRecords,
+			[fileId]: {
+				cacheId: mirror.cacheId,
+				name: mirror.name || '',
+				size: mirror.size || 0,
+				contentType: mirror.contentType || '',
+				sourceUrl: mirror.sourceUrl || '',
+				createdAt: mirror.createdAt || new Date().toISOString(),
+				method: mirror.method || ''
+			}
+		};
+		saveLocalMirrorRecords();
+		uploadedImports = uploadedImports.map((file) =>
+			file.id === fileId ? normalizeBackendFile(file) : file
+		);
+	}
+
+	function beginLocalMirrorDownload(
+		sourceUrl,
+		{ kind = 'remote', label = 'Local source mirror' } = {}
+	) {
+		const token = newClientTaskId('mirror');
+		const item = {
+			token,
+			sourceUrl,
+			kind,
+			label,
+			fileId: '',
+			mirror: null,
+			error: ''
+		};
+		addInferenceLog('Local source mirror started', { token, kind, sourceUrl });
+		const promise = fetch(resolve('/api/local-mirror'), {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ url: sourceUrl, kind })
+		})
+			.then(async (response) => {
+				const result = await response.json().catch(() => ({}));
+				if (!response.ok || !result.mirror) throw new Error(result.message || `${label} failed`);
+				return result.mirror;
+			})
+			.then((mirror) => {
+				item.mirror = mirror;
+				addInferenceLog('Local source mirror ready', {
+					token,
+					fileId: item.fileId,
+					cacheId: mirror.cacheId,
+					name: mirror.name,
+					size: mirror.size ? formatBytes(mirror.size) : undefined,
+					method: mirror.method
+				});
+				if (item.fileId && !item.skipStore) rememberLocalMirror(item.fileId, mirror);
+				return mirror;
+			})
+			.catch((error) => {
+				item.error = error?.message || String(error);
+				addInferenceLog('Local source mirror failed', { token, error: item.error }, 'error');
+				throw error;
+			});
+		promise.catch(() => {});
+		item.promise = promise;
+		remoteMirrorQueue = [...remoteMirrorQueue, item];
+		return item;
+	}
+
+	function attachNextLocalMirror(fileId, payload = {}) {
+		if (!fileId || localMirrorRecords[fileId]) return;
+		const item = remoteMirrorQueue.find((entry) => !entry.fileId && !entry.skipStore);
+		if (!item) return;
+		item.fileId = fileId;
+		localMirrorPromisesByFile.set(fileId, item.promise);
+		addInferenceLog('Local source mirror attached to backend file', {
+			token: item.token,
+			fileId,
+			fileName:
+				payload.file_name || payload.original_name || payload.expected_path?.split('/').pop()
+		});
+		if (item.mirror) {
+			if (!item.skipStore) rememberLocalMirror(fileId, item.mirror);
+			localMirrorPromisesByFile.delete(fileId);
+		} else {
+			item.promise.finally(() => localMirrorPromisesByFile.delete(fileId)).catch(() => {});
+		}
+	}
+
+	function discardLocalMirror(fileId, reason = 'Local mirror discarded') {
+		const item = remoteMirrorQueue.find((entry) => entry.fileId === fileId);
+		if (item) item.skipStore = true;
+		localMirrorPromisesByFile.delete(fileId);
+		if (localMirrorRecords[fileId]) {
+			const { [fileId]: _removed, ...remaining } = localMirrorRecords;
+			localMirrorRecords = remaining;
+			saveLocalMirrorRecords();
+		}
+		uploadedImports = uploadedImports.map((file) =>
+			file.id === fileId
+				? { ...file, localMirrorId: '', localMirrorReady: false, localMirrorName: '' }
+				: file
+		);
+		addInferenceLog(reason, { fileId });
+	}
+
+	function discardNextUnassignedLocalMirror(reason = 'Local mirror discarded') {
+		const item = remoteMirrorQueue.find((entry) => !entry.fileId && !entry.skipStore);
+		if (!item) return;
+		item.skipStore = true;
+		addInferenceLog(reason, { token: item.token, sourceUrl: item.sourceUrl });
 	}
 
 	function reportInferenceIssue(message) {
@@ -288,6 +459,53 @@
 		return Math.max(0, Math.min(100, Math.round(number)));
 	}
 
+	function formatSampleTime(value) {
+		const seconds = Number(value);
+		if (!Number.isFinite(seconds)) return '';
+		if (seconds >= 60) {
+			const minutes = Math.floor(seconds / 60);
+			const remaining = Math.floor(seconds % 60);
+			return `${minutes}:${String(remaining).padStart(2, '0')}`;
+		}
+		return `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
+	}
+
+	function samplingTaskAttrs(done, total, detail = {}) {
+		const safeDone = Math.max(0, Number(done) || 0);
+		const safeTotal = Math.max(0, Number(total) || 0);
+		const index = Math.max(1, Number(detail.index) || safeDone + 1);
+		const phase = detail.phase || 'captured';
+		let unitsDone = safeDone;
+		if (safeTotal) {
+			const baseIndex = Math.min(safeTotal, Math.max(0, index - 1));
+			if (phase === 'seeking') unitsDone = Math.max(unitsDone, baseIndex + 0.25);
+			if (phase === 'encoding') unitsDone = Math.max(unitsDone, baseIndex + 0.65);
+		}
+		const samplingPercent = safeTotal ? clampProgress((unitsDone / safeTotal) * 100) : 0;
+		const progress = safeTotal ? 6 + Math.round((unitsDone / safeTotal) * 24) : 6;
+		let status = safeTotal ? `Sampling frames ${safeDone}/${safeTotal}` : 'Sampling video';
+		if (phase === 'metadata') status = 'Sampling video · reading metadata';
+		if (phase === 'planned') status = `Sampling frames 0/${safeTotal}`;
+		if (phase === 'seeking') {
+			const time = formatSampleTime(detail.time);
+			status = `Sampling frame ${Math.min(index, safeTotal)}/${safeTotal} · seeking${time ? ` ${time}` : ''}`;
+		}
+		if (phase === 'encoding') {
+			status = `Sampling frame ${Math.min(index, safeTotal)}/${safeTotal} · encoding`;
+		}
+
+		return {
+			status,
+			progress: Math.min(30, Math.max(6, progress)),
+			sampling: {
+				done: safeDone,
+				total: safeTotal,
+				phase,
+				percent: samplingPercent
+			}
+		};
+	}
+
 	function formatBytes(bytes = 0) {
 		const value = Number(bytes) || 0;
 		if (value < 1024) return `${value} B`;
@@ -299,6 +517,32 @@
 			unit = units[i];
 		}
 		return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${unit}`;
+	}
+
+	function sourceVideoTaskAttrs(received = 0, total = 0, stage = 'loading') {
+		const safeReceived = Math.max(0, Number(received) || 0);
+		const safeTotal = Math.max(0, Number(total) || 0);
+		const percent = safeTotal ? clampProgress((safeReceived / safeTotal) * 100) : 0;
+		const progress = safeTotal ? 4 + Math.round((safeReceived / safeTotal) * 2) : 4;
+		const bytes = safeTotal
+			? `${formatBytes(safeReceived)} / ${formatBytes(safeTotal)}`
+			: formatBytes(safeReceived);
+		return {
+			status:
+				stage === 'complete'
+					? `Source video loaded · ${bytes}`
+					: safeTotal
+						? `Loading source video ${percent}%`
+						: `Loading source video · ${bytes}`,
+			progress: Math.min(6, Math.max(4, progress)),
+			sourceVideo: {
+				received: safeReceived,
+				total: safeTotal,
+				percent,
+				stage,
+				bytes
+			}
+		};
 	}
 
 	function detectionCount(result = {}) {
@@ -355,6 +599,7 @@
 			taskName: item.taskName || taskDisplayName(item.taskId),
 			chunkId: item.chunkId || '',
 			model: item.model || result.kind || loadedModelType || inferenceModel,
+			classId: Number.isInteger(item.classId) ? item.classId : null,
 			className: item.className || resultClassLabel(result),
 			frameIndex: item.frameIndex ?? 0,
 			fileId: item.fileId || '',
@@ -423,6 +668,159 @@
 			storedResults[0] ||
 			null
 		);
+	}
+
+	function normalizeClassName(value) {
+		return (
+			String(value || 'object')
+				.trim()
+				.replace(/\s+/g, ' ') || 'object'
+		);
+	}
+
+	function mappedClassName(name) {
+		const normalized = normalizeClassName(name);
+		const mapping = classMappings.find((item) => item.source === normalized);
+		return normalizeClassName(mapping?.target || normalized);
+	}
+
+	function isSamResultRecord(record = {}) {
+		record = record || {};
+		const result = record.result || {};
+		const model = String(record.model || result.kind || '').toLowerCase();
+		if (model.includes('sam')) return true;
+		if (model.includes('yolo')) return false;
+		return Array.isArray(result.masks) && !Array.isArray(result.classes);
+	}
+
+	function liveResultToRecord(item = {}) {
+		const result = item.result || {};
+		return {
+			key: item.key,
+			taskId: item.taskId || '',
+			taskName: item.taskName || taskDisplayName(item.taskId),
+			chunkId: item.chunkId || '',
+			model: item.model || result.kind || 'sam',
+			classId: Number.isInteger(item.classId) ? item.classId : null,
+			className: item.className || resultClassLabel(result),
+			frameIndex: item.frameIndex ?? 0,
+			fileId: item.fileId || '',
+			fileName: item.fileName || '',
+			detections: item.detections ?? detectionCount(result),
+			result,
+			imageDataUrl: item.imageDataUrl || result.image_data_url || '',
+			imgUrl: item.imgUrl || '',
+			createdAt: new Date().toISOString()
+		};
+	}
+
+	function allSamResultRecords() {
+		const records = new Map();
+		for (const item of liveResults) {
+			const record = liveResultToRecord(item);
+			if (record.key && isSamResultRecord(record)) {
+				records.set(record.key, record);
+			}
+		}
+		for (const record of storedResults) {
+			if (record?.key && isSamResultRecord(record) && !records.has(record.key)) {
+				records.set(record.key, record);
+			}
+		}
+		return Array.from(records.values());
+	}
+
+	function samResultTaskOptions() {
+		const byTask = new Map();
+		for (const record of allSamResultRecords()) {
+			const id = record.taskId || 'unknown';
+			if (!byTask.has(id)) {
+				byTask.set(id, {
+					id,
+					name: record.taskName || id,
+					records: 0,
+					frames: new Set()
+				});
+			}
+			const task = byTask.get(id);
+			task.records += 1;
+			task.frames.add(record.frameIndex ?? 0);
+		}
+		return Array.from(byTask.values()).map((task) => ({
+			id: task.id,
+			name: task.name,
+			records: task.records,
+			frames: task.frames.size
+		}));
+	}
+
+	function latestSamResultTaskId() {
+		return samResultTaskOptions()[0]?.id || '';
+	}
+
+	function selectedDatasetSourceRecords() {
+		const records = allSamResultRecords();
+		if (datasetResultTaskId === 'all') return records;
+		const taskId = datasetResultTaskId === 'latest' ? latestSamResultTaskId() : datasetResultTaskId;
+		if (!taskId) return [];
+		return records.filter((record) => (record.taskId || 'unknown') === taskId);
+	}
+
+	function datasetClassNamesForRecords(records = selectedDatasetSourceRecords()) {
+		const observed = new Map();
+		for (const record of records) {
+			const className = mappedClassName(record.className || resultClassLabel(record.result));
+			if (!observed.has(className)) {
+				observed.set(className, {
+					name: className,
+					classId: Number.isInteger(record.classId) ? record.classId : null
+				});
+			}
+		}
+		const observedNames = new Set(observed.keys());
+		const promptOrdered = promptTags
+			.map(mappedClassName)
+			.filter((name, index, list) => observedNames.has(name) && list.indexOf(name) === index);
+		const remaining = Array.from(observed.values())
+			.filter((item) => !promptOrdered.includes(item.name))
+			.sort((a, b) => {
+				if (Number.isInteger(a.classId) && Number.isInteger(b.classId)) {
+					return a.classId - b.classId;
+				}
+				if (Number.isInteger(a.classId)) return -1;
+				if (Number.isInteger(b.classId)) return 1;
+				return a.name.localeCompare(b.name);
+			})
+			.map((item) => item.name);
+		return [...promptOrdered, ...remaining];
+	}
+
+	function datasetSourceStats(records = selectedDatasetSourceRecords()) {
+		const frames = new Set();
+		let boxes = 0;
+		let masks = 0;
+		for (const record of records) {
+			frames.add(`${record.taskId || 'task'}:${record.frameIndex ?? 0}`);
+			boxes += record.result?.boxes?.length || 0;
+			masks += record.result?.masks?.length || 0;
+		}
+		return {
+			recordCount: records.length,
+			frameCount: frames.size,
+			boxes,
+			masks,
+			classCount: datasetClassNamesForRecords(records).length
+		};
+	}
+
+	function useResultsForDataset(record = selectedExplorerResult()) {
+		if (!record) return;
+		datasetResultTaskId =
+			resultTaskFilter !== 'all'
+				? resultTaskFilter
+				: record.taskId || latestSamResultTaskId() || 'latest';
+		setTab('Export');
+		notify('SAM results selected for dataset export');
 	}
 
 	function exportStoredResult(record = selectedExplorerResult()) {
@@ -783,6 +1181,7 @@
 					notify(errorMessage(payload));
 					break;
 				case 'file_download_initiated':
+					attachNextLocalMirror(payload.file_id, payload);
 					upsertTask(payload.file_id, {
 						name: payload.file_name || 'Google Drive import',
 						status: 'Downloading',
@@ -812,6 +1211,12 @@
 					});
 					break;
 				case 'file_download_completed':
+					attachNextLocalMirror(payload.file_id, payload);
+					if (payload.converted)
+						discardLocalMirror(
+							payload.file_id,
+							'Local source mirror ignored because backend converted the import'
+						);
 					upsertTask(payload.file_id, { status: 'Completed', progress: 100 });
 					googleDriveUrl = '';
 					datasetDirectUrl = '';
@@ -821,6 +1226,13 @@
 					notify('Backend download completed');
 					break;
 				case 'download_failed':
+					if (payload.file_id)
+						discardLocalMirror(
+							payload.file_id,
+							'Local mirror ignored after backend download failed'
+						);
+					else
+						discardNextUnassignedLocalMirror('Local mirror ignored after backend download failed');
 					upsertTask(payload.file_id, { status: 'Failed' });
 					uploadBusy = false;
 					failUploadProgress(errorMessage(payload));
@@ -925,12 +1337,16 @@
 	}
 
 	function normalizeBackendFile(file) {
+		const mirror = localMirrorRecords[file.id];
 		return {
 			...file,
 			id: file.id,
 			originalName: file.originalName || file.original_name || '',
 			converted: Boolean(file.converted),
-			conversionError: file.conversionError || file.conversion_error || ''
+			conversionError: file.conversionError || file.conversion_error || '',
+			localMirrorId: mirror?.cacheId || file.localMirrorId || file.local_mirror_id || '',
+			localMirrorReady: Boolean(mirror?.cacheId || file.localMirrorReady),
+			localMirrorName: mirror?.name || file.localMirrorName || ''
 		};
 	}
 
@@ -1006,16 +1422,182 @@
 		return `${resolve('/api/files')}?${params.toString()}`;
 	}
 
-	async function ensureOriginalUrl(file) {
-		if (originalUrls[file.id]) return originalUrls[file.id];
-		const response = await fetch(backendFileUrl(file));
+	async function ensureOriginalUrl(file, { taskId = '' } = {}) {
+		if (originalUrls[file.id]) {
+			addInferenceLog('Using cached source video object URL', {
+				taskId,
+				fileId: file.id,
+				fileName: file.name
+			});
+			return originalUrls[file.id];
+		}
+
+		const localMirror = localMirrorRecords[file.id];
+		if (localMirror?.cacheId) {
+			addInferenceLog('Using local mirrored source video', {
+				taskId,
+				fileId: file.id,
+				fileName: file.name,
+				cacheId: localMirror.cacheId,
+				size: localMirror.size ? formatBytes(localMirror.size) : undefined,
+				method: localMirror.method
+			});
+			return localMirrorUrl(localMirror.cacheId);
+		}
+
+		const pendingLocalMirror = localMirrorPromisesByFile.get(file.id);
+		if (pendingLocalMirror) {
+			addInferenceLog('Waiting for local source mirror before sampling', {
+				taskId,
+				fileId: file.id,
+				fileName: file.name
+			});
+			if (taskId) {
+				upsertTask(taskId, {
+					status: 'Waiting for local source mirror',
+					progress: 4
+				});
+				setInferenceFeedback('Waiting for local source mirror');
+			}
+			try {
+				const mirror = await pendingLocalMirror;
+				rememberLocalMirror(file.id, mirror);
+				return localMirrorUrl(mirror.cacheId);
+			} catch (error) {
+				throw new Error(error?.message || 'Local source mirror failed');
+			}
+		}
+
+		if (detectFileType(file.name) === 'video') {
+			addInferenceLog(
+				'No local source mirror is available; refusing notebook video download',
+				{ taskId, fileId: file.id, fileName: file.name },
+				'error'
+			);
+			throw new Error(
+				'Local source mirror is not available. Re-import this video so the website can cache it locally for SAM sampling.'
+			);
+		}
+
+		const proxyUrl = backendFileUrl(file);
+		const startedAt = performance.now();
+		addInferenceLog('Source video fetch requested', {
+			taskId,
+			fileId: file.id,
+			fileName: file.name,
+			backendUrl,
+			proxyUrl,
+			note: 'Backend may be behind NAT; website fetches through configured backend/tunnel URL via the local proxy route.'
+		});
+
+		let response;
+		try {
+			response = await fetch(proxyUrl);
+		} catch (error) {
+			addInferenceLog(
+				'Source video fetch failed before response',
+				{ taskId, error: error?.message || String(error) },
+				'error'
+			);
+			throw error;
+		}
+
+		const contentLength = Number(response.headers.get('content-length')) || 0;
+		const contentType = response.headers.get('content-type') || '';
+		addInferenceLog('Source video response received', {
+			taskId,
+			status: response.status,
+			ok: response.ok,
+			contentType,
+			contentLength: contentLength ? formatBytes(contentLength) : 'unknown'
+		});
+
 		if (!response.ok) {
 			const message = await response.text();
+			addInferenceLog(
+				'Source video response rejected',
+				{ taskId, status: response.status, message },
+				'error'
+			);
 			throw new Error(message || 'Could not load backend video for sampling');
 		}
-		const blob = await response.blob();
+
+		if (taskId) {
+			const attrs = sourceVideoTaskAttrs(0, contentLength, 'loading');
+			upsertTask(taskId, attrs);
+			setInferenceFeedback(attrs.status);
+		}
+
+		let blob;
+		if (response.body && typeof response.body.getReader === 'function') {
+			const reader = response.body.getReader();
+			const chunks = [];
+			let received = 0;
+			let lastLoggedPercent = -5;
+			let lastLoggedBytes = 0;
+			let lastUiUpdateAt = 0;
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (!value) continue;
+
+				chunks.push(value);
+				received += value.byteLength;
+
+				const percent = contentLength ? clampProgress((received / contentLength) * 100) : 0;
+				const now = performance.now();
+				const shouldUpdateUi = taskId && (now - lastUiUpdateAt > 250 || received >= contentLength);
+				const shouldLog = contentLength
+					? percent >= lastLoggedPercent + 5 || percent === 100
+					: received - lastLoggedBytes >= 1024 * 1024;
+
+				if (shouldUpdateUi) {
+					const attrs = sourceVideoTaskAttrs(received, contentLength, 'loading');
+					upsertTask(taskId, attrs);
+					setInferenceFeedback(attrs.status);
+					lastUiUpdateAt = now;
+				}
+
+				if (shouldLog) {
+					addInferenceLog('Source video stream progress', {
+						taskId,
+						received: formatBytes(received),
+						total: contentLength ? formatBytes(contentLength) : 'unknown',
+						percent: contentLength ? percent : undefined
+					});
+					lastLoggedPercent = percent;
+					lastLoggedBytes = received;
+				}
+			}
+
+			blob = new Blob(chunks, { type: contentType || 'application/octet-stream' });
+			addInferenceLog('Source video stream complete', {
+				taskId,
+				size: formatBytes(blob.size),
+				elapsedMs: performance.now() - startedAt
+			});
+		} else {
+			addInferenceLog('Source video response body is not stream-readable; waiting for blob()', {
+				taskId
+			});
+			blob = await response.blob();
+		}
+
 		const url = URL.createObjectURL(blob);
 		originalUrls = { ...originalUrls, [file.id]: url };
+		if (taskId) {
+			const attrs = sourceVideoTaskAttrs(blob.size, contentLength || blob.size, 'complete');
+			upsertTask(taskId, attrs);
+			setInferenceFeedback(attrs.status);
+		}
+		addInferenceLog('Source video object URL created', {
+			taskId,
+			fileId: file.id,
+			size: formatBytes(blob.size),
+			type: blob.type || contentType || 'unknown',
+			elapsedMs: performance.now() - startedAt
+		});
 		return url;
 	}
 
@@ -1190,6 +1772,15 @@
 			className: promptTags.join(', ')
 		});
 		setInferenceFeedback(`Request ${requestId} created. Preparing SAM input.`);
+		addInferenceLog('SAM inference request created', {
+			taskId: requestId,
+			fileId: file.id,
+			fileName: file.name,
+			fileType: detectFileType(file.name),
+			prompts: promptTags,
+			fps: Number(samFps),
+			maxFrames: Number(samMaxFrames) || 0
+		});
 
 		let fileIds;
 		if (detectFileType(file.name) === 'image') {
@@ -1205,31 +1796,63 @@
 			try {
 				if (!originalUrls[file.id]) {
 					modelState = 'Loading source video';
-					upsertTask(requestId, { status: 'Loading source video', progress: 4 });
+					upsertTask(requestId, sourceVideoTaskAttrs(0, 0, 'loading'));
 					notify('Loading source video from backend');
 				}
-				const videoUrl = await ensureOriginalUrl(file);
+				const videoUrl = await ensureOriginalUrl(file, { taskId: requestId });
 				upsertTask(requestId, { status: `Sampling video at ${samFps} fps`, progress: 6 });
 				setInferenceFeedback('Sampling video frames for SAM');
 				notify(`Sampling video at ${samFps} fps…`);
+				addInferenceLog('Browser video sampling started', {
+					taskId: requestId,
+					fps: Number(samFps),
+					maxFrames: Number(samMaxFrames) || 0
+				});
+				let lastSamplingLogBucket = -10;
 				const frames = await sampleVideoFrames(
 					videoUrl,
 					Number(samFps),
 					Number(samMaxFrames) || 0,
-					(done, total) => {
-						modelState = `Sampling ${done}/${total}`;
-						const progress = total ? 6 + Math.round((done / total) * 24) : 10;
-						upsertTask(requestId, {
-							status: `Sampling frames ${done}/${total}`,
-							progress: Math.min(30, progress)
-						});
-						setInferenceFeedback(`Sampling frames ${done}/${total}`);
+					(done, total, detail = {}) => {
+						const attrs = samplingTaskAttrs(done, total, detail);
+						modelState = attrs.status;
+						upsertTask(requestId, attrs);
+						setInferenceFeedback(attrs.status);
+						const phase = detail.phase || 'captured';
+						const percent = attrs.sampling?.percent || 0;
+						const bucket = Math.floor(percent / 10) * 10;
+						const shouldLog =
+							phase === 'metadata' ||
+							phase === 'planned' ||
+							total <= 5 ||
+							(phase === 'seeking' && Number(detail.index) === 1) ||
+							(phase === 'captured' && (bucket > lastSamplingLogBucket || done === total));
+						if (shouldLog) {
+							if (phase === 'captured')
+								lastSamplingLogBucket = Math.max(lastSamplingLogBucket, bucket);
+							addInferenceLog(attrs.status, {
+								taskId: requestId,
+								phase,
+								done,
+								total,
+								percent,
+								frame: detail.index,
+								time: detail.time,
+								duration: detail.duration,
+								size: detail.width && detail.height ? `${detail.width}x${detail.height}` : undefined
+							});
+						}
 					}
 				);
 				if (!frames.length) {
 					failInferenceTask({ id: requestId }, 'No frames sampled from video');
 					return;
 				}
+				addInferenceLog('Browser video sampling complete', {
+					taskId: requestId,
+					frames: frames.length,
+					totalBytes: formatBytes(frames.reduce((sum, frame) => sum + (frame.blob?.size || 0), 0))
+				});
 				const blobs = frames.map((f) => f.blob);
 				const names = frames.map((_, i) => `${file.name}-f${String(i).padStart(5, '0')}.jpg`);
 
@@ -1374,6 +1997,7 @@
 							taskId: jobId,
 							chunkId: e.taskId,
 							model: 'sam',
+							classId: e.classId,
 							className: e.className || 'objects',
 							frameIndex: e.frameIndex,
 							fileId: e.fileId || '',
@@ -1465,130 +2089,280 @@
 		return { update: paint };
 	}
 
+	function safeDatasetName(value) {
+		return (
+			String(value || 'sam-dataset')
+				.trim()
+				.replace(/[^a-zA-Z0-9._-]+/g, '-')
+				.replace(/^-+|-+$/g, '') || 'sam-dataset'
+		);
+	}
+
+	function safeFrameName(value) {
+		return (
+			String(value || 'frame')
+				.trim()
+				.replace(/[^a-zA-Z0-9._-]+/g, '_')
+				.replace(/^_+|_+$/g, '') || 'frame'
+		);
+	}
+
+	function imageUrlForRecord(record = {}) {
+		return record.imageDataUrl || record.result?.image_data_url || record.imgUrl || '';
+	}
+
+	async function imageBlobFromUrl(url) {
+		if (!url) return null;
+		const response = await fetch(url);
+		if (!response.ok) return null;
+		const blob = await response.blob();
+		return blob.size ? blob : null;
+	}
+
+	function imageExtensionForBlob(blob) {
+		const type = String(blob?.type || '').toLowerCase();
+		if (type.includes('png')) return 'png';
+		if (type.includes('webp')) return 'webp';
+		if (type.includes('bmp')) return 'bmp';
+		return 'jpg';
+	}
+
+	async function imageSizeFromBlob(blob) {
+		if (!blob) return { width: 0, height: 0 };
+		if (typeof createImageBitmap === 'function') {
+			try {
+				const bitmap = await createImageBitmap(blob);
+				const size = { width: bitmap.width, height: bitmap.height };
+				bitmap.close?.();
+				return size;
+			} catch {
+				/* fall through */
+			}
+		}
+		return new Promise((resolveSize) => {
+			const url = URL.createObjectURL(blob);
+			const img = new Image();
+			img.onload = () => {
+				const size = { width: img.naturalWidth || 0, height: img.naturalHeight || 0 };
+				URL.revokeObjectURL(url);
+				resolveSize(size);
+			};
+			img.onerror = () => {
+				URL.revokeObjectURL(url);
+				resolveSize({ width: 0, height: 0 });
+			};
+			img.src = url;
+		});
+	}
+
+	function finiteNumber(value) {
+		const number = Number(value);
+		return Number.isFinite(number) ? number : null;
+	}
+
+	function resultBoxes(result = {}) {
+		const boxes = Array.isArray(result.boxes) ? result.boxes : [];
+		return boxes
+			.map((box) => {
+				const x1 = finiteNumber(box?.[0]);
+				const y1 = finiteNumber(box?.[1]);
+				const x2 = finiteNumber(box?.[2]);
+				const y2 = finiteNumber(box?.[3]);
+				if ([x1, y1, x2, y2].some((value) => value == null)) return null;
+				return [x1, y1, x2, y2];
+			})
+			.filter(Boolean);
+	}
+
+	function normalizePolygonPoints(poly) {
+		const source = Array.isArray(poly?.points) ? poly.points : poly;
+		if (!Array.isArray(source)) return [];
+		if (Array.isArray(source[0])) {
+			return source
+				.map((point) => [finiteNumber(point?.[0]), finiteNumber(point?.[1])])
+				.filter(([x, y]) => x != null && y != null);
+		}
+		const points = [];
+		for (let i = 0; i < source.length - 1; i += 2) {
+			const x = finiteNumber(source[i]);
+			const y = finiteNumber(source[i + 1]);
+			if (x != null && y != null) points.push([x, y]);
+		}
+		return points;
+	}
+
+	function addBoxPolygons(entry, boxes, classId) {
+		for (const [x1, y1, x2, y2] of boxes) {
+			entry.polygons.push({
+				classId,
+				points: [
+					[x1, y1],
+					[x2, y1],
+					[x2, y2],
+					[x1, y2]
+				]
+			});
+		}
+	}
+
+	function appendResultPolygons(entry, result, boxes, classId) {
+		const explicitPolygons = result.polygons || result.segments || [];
+		let added = 0;
+		for (const poly of explicitPolygons) {
+			const points = normalizePolygonPoints(poly);
+			if (points.length >= 3) {
+				entry.polygons.push({ classId, points });
+				added += 1;
+			}
+		}
+		if (added) return;
+
+		const masks = result.masks || [];
+		for (let mi = 0; mi < masks.length; mi += 1) {
+			let decoded;
+			try {
+				decoded = decodeMask(masks[mi]);
+			} catch {
+				decoded = null;
+			}
+			if (!decoded) continue;
+			if (!entry.width) entry.width = decoded.w;
+			if (!entry.height) entry.height = decoded.h;
+			const polys = maskToPolygons(decoded.bits, decoded.w, decoded.h, {
+				minArea: 16,
+				simplifyTol: 1.5
+			});
+			if (polys.length) {
+				for (const poly of polys) entry.polygons.push({ classId, points: poly.points });
+				added += polys.length;
+			} else if (boxes[mi]) {
+				addBoxPolygons(entry, [boxes[mi]], classId);
+				added += 1;
+			}
+		}
+		if (!added) addBoxPolygons(entry, boxes, classId);
+	}
+
+	async function datasetFramesFromRecords(records, classes) {
+		const byFrame = new Map();
+		const exportAllTasks = datasetResultTaskId === 'all';
+		for (const record of records) {
+			const result = record.result || {};
+			const frameIndex = record.frameIndex ?? 0;
+			const frameKey = `${record.taskId || 'task'}:${frameIndex}`;
+			if (!byFrame.has(frameKey)) {
+				const taskPrefix = exportAllTasks ? `${safeFrameName(record.taskId || 'task')}_` : '';
+				const numericFrame = Number.isFinite(Number(frameIndex))
+					? String(Number(frameIndex)).padStart(6, '0')
+					: safeFrameName(frameIndex);
+				byFrame.set(frameKey, {
+					name: `${taskPrefix}frame_${numericFrame}`,
+					imgUrl: imageUrlForRecord(record),
+					width: Number(result.width) || 0,
+					height: Number(result.height) || 0,
+					boxes: [],
+					polygons: []
+				});
+			}
+			const entry = byFrame.get(frameKey);
+			if (!entry.imgUrl) entry.imgUrl = imageUrlForRecord(record);
+			if (!entry.width && result.width) entry.width = Number(result.width) || 0;
+			if (!entry.height && result.height) entry.height = Number(result.height) || 0;
+
+			const className = mappedClassName(record.className || resultClassLabel(result));
+			const classId = classes.indexOf(className);
+			if (classId < 0) continue;
+
+			const boxes = resultBoxes(result);
+			for (const [x1, y1, x2, y2] of boxes) {
+				entry.boxes.push({ classId, x1, y1, x2, y2 });
+			}
+			if (exportFormat === 'segment') appendResultPolygons(entry, result, boxes, classId);
+		}
+
+		const frames = [];
+		for (const entry of byFrame.values()) {
+			let imageBlob = null;
+			let imageExt = 'jpg';
+			try {
+				imageBlob = await imageBlobFromUrl(entry.imgUrl);
+				imageExt = imageExtensionForBlob(imageBlob);
+			} catch {
+				imageBlob = null;
+			}
+			if (imageBlob && (!entry.width || !entry.height)) {
+				const size = await imageSizeFromBlob(imageBlob);
+				entry.width = entry.width || size.width;
+				entry.height = entry.height || size.height;
+			}
+			frames.push({
+				name: safeFrameName(entry.name),
+				imageBlob,
+				imageExt,
+				width: entry.width,
+				height: entry.height,
+				boxes: entry.boxes,
+				polygons: entry.polygons
+			});
+		}
+		return frames;
+	}
+
 	// Compile the streamed SAM results into a YOLO-compatible dataset zip.
 	// Each prompt is a class; boxes become YOLO detection labels.
-	async function exportYoloDataset() {
-		if (!liveResults.length) {
-			notify('Run SAM inference first to generate results');
+	async function exportYoloDataset(options = {}) {
+		const records = selectedDatasetSourceRecords();
+		if (!records.length) {
+			notify('Run SAM inference first, then save or select local results');
 			return;
 		}
-		const classes = promptTags.slice();
+		const classes = datasetClassNamesForRecords(records);
 		if (!classes.length) {
-			notify('No prompt classes available to label');
+			notify('No SAM classes available to label');
 			return;
 		}
 		exportingDataset = true;
 		const segment = exportFormat === 'segment';
 		try {
-			// Group all per-prompt results by source frame.
-			const byFrame = new Map();
-			for (const item of liveResults) {
-				const f = item.frameIndex;
-				if (!byFrame.has(f)) {
-					byFrame.set(f, {
-						name: `frame_${String(f).padStart(6, '0')}`,
-						imgUrl: item.imgUrl,
-						width: item.result.width,
-						height: item.result.height,
-						boxes: [],
-						polygons: []
-					});
-				}
-				const entry = byFrame.get(f);
-				const classId = classes.indexOf(item.className);
-				if (classId < 0) continue;
-				const boxes = item.result.boxes || [];
-				for (const b of boxes) {
-					entry.boxes.push({ classId, x1: b[0], y1: b[1], x2: b[2], y2: b[3] });
-				}
-				if (segment) {
-					const masks = item.result.masks || [];
-					if (masks.length) {
-						masks.forEach((maskObj, mi) => {
-							let decoded;
-							try {
-								decoded = decodeMask(maskObj);
-							} catch {
-								decoded = null;
-							}
-							if (!decoded) return;
-							const polys = maskToPolygons(decoded.bits, decoded.w, decoded.h, {
-								minArea: 16,
-								simplifyTol: 1.5
-							});
-							if (polys.length) {
-								for (const p of polys) entry.polygons.push({ classId, points: p.points });
-							} else if (boxes[mi]) {
-								// Tracer found nothing usable — fall back to the box rectangle.
-								const [x1, y1, x2, y2] = boxes[mi];
-								entry.polygons.push({
-									classId,
-									points: [
-										[x1, y1],
-										[x2, y1],
-										[x2, y2],
-										[x1, y2]
-									]
-								});
-							}
-						});
-					} else {
-						// No masks — fall back to each box as a 4-point polygon.
-						for (const b of boxes) {
-							entry.polygons.push({
-								classId,
-								points: [
-									[b[0], b[1]],
-									[b[2], b[1]],
-									[b[2], b[3]],
-									[b[0], b[3]]
-								]
-							});
-						}
-					}
-				}
-			}
-
-			const frames = [];
-			for (const entry of byFrame.values()) {
-				let imageBlob = null;
-				if (entry.imgUrl) {
-					try {
-						imageBlob = await (await fetch(entry.imgUrl)).blob();
-					} catch {
-						imageBlob = null;
-					}
-				}
-				frames.push({
-					name: entry.name,
-					imageBlob,
-					width: entry.width,
-					height: entry.height,
-					boxes: entry.boxes,
-					polygons: entry.polygons
+			const frames = await datasetFramesFromRecords(records, classes);
+			const datasetName = safeDatasetName(datasetManifestName);
+			const { blob, frameCount, labeledFrames, boxesTotal, skippedFrames, trainFrames, valFrames } =
+				await buildYoloDataset({
+					classes,
+					frames,
+					name: datasetName,
+					format: exportFormat,
+					valRatio: Math.max(0, Math.min(0.5, Number(datasetValidationPercent) / 100))
 				});
+
+			if (!frameCount) throw new Error('No source images were available for the YOLO dataset');
+
+			const uploadToBackend = Boolean(options.uploadToBackend);
+			const downloadToBrowser = options.downloadToBrowser ?? !uploadToBackend;
+
+			if (downloadToBrowser) {
+				const link = document.createElement('a');
+				link.href = URL.createObjectURL(blob);
+				link.download = `${datasetName}.zip`;
+				link.click();
+				URL.revokeObjectURL(link.href);
 			}
 
-			const datasetName = datasetManifestName?.trim() || 'sam-dataset';
-			const { blob, frameCount, labeledFrames, boxesTotal } = await buildYoloDataset({
-				classes,
-				frames,
-				name: datasetName,
-				format: exportFormat
-			});
-
-			const link = document.createElement('a');
-			link.href = URL.createObjectURL(blob);
-			link.download = `${datasetName}.zip`;
-			link.click();
-			URL.revokeObjectURL(link.href);
+			if (uploadToBackend) {
+				const file = new File([blob], `${datasetName}.zip`, { type: 'application/zip' });
+				const uploaded = await uploadFilesToBackend([file], 'dataset zip');
+				if (uploaded[0]) useDatasetAsset(uploaded[0]);
+			}
 
 			datasetStats = {
 				frameCount,
 				labeledFrames,
 				boxesTotal,
 				classes: classes.length,
-				format: exportFormat
+				format: exportFormat,
+				skippedFrames,
+				trainFrames,
+				valFrames
 			};
 			const unit = segment ? 'polygons' : 'boxes';
 			notify(
@@ -1629,6 +2403,7 @@
 
 	onMount(() => {
 		backendUrl = localStorage.getItem('backendUrl') || defaultBackendUrl();
+		loadLocalMirrorRecords();
 		try {
 			const raw = localStorage.getItem('savedPrompts');
 			if (raw) savedPrompts = JSON.parse(raw);
@@ -1721,11 +2496,16 @@
 			});
 			if (!Array.isArray(result.files)) throw new Error(result.message || 'Upload failed');
 			const records = result.files.map(normalizeBackendFile);
+			records.forEach((record, index) => {
+				const mirror = result.files[index]?.localMirror;
+				if (mirror?.cacheId && !record.converted) rememberLocalMirror(record.id, mirror);
+			});
+			const recordsWithMirrors = records.map(normalizeBackendFile);
 			// Keep local object URLs so we can overlay SAM masks on images and
 			// sample frames from videos locally. result.files is returned in the
 			// same order we appended `files`.
 			const urls = {};
-			records.forEach((record, index) => {
+			recordsWithMirrors.forEach((record, index) => {
 				const source = files[index];
 				if (
 					source &&
@@ -1738,10 +2518,16 @@
 				}
 			});
 			if (Object.keys(urls).length) originalUrls = { ...originalUrls, ...urls };
-			uploadedImports = [...records, ...uploadedImports];
-			reconcileAssetSelections({ preferredMediaId: records.find(isMediaFile)?.id || '' });
-			notify(`${records.length} file${records.length === 1 ? '' : 's'} uploaded to backend`);
-			finishUploadProgress(`${records.length} file${records.length === 1 ? '' : 's'} uploaded`);
+			uploadedImports = [...recordsWithMirrors, ...uploadedImports];
+			reconcileAssetSelections({
+				preferredMediaId: recordsWithMirrors.find(isMediaFile)?.id || ''
+			});
+			notify(
+				`${recordsWithMirrors.length} file${recordsWithMirrors.length === 1 ? '' : 's'} uploaded to backend`
+			);
+			finishUploadProgress(
+				`${recordsWithMirrors.length} file${recordsWithMirrors.length === 1 ? '' : 's'} uploaded`
+			);
 		} catch (error) {
 			failUploadProgress(error instanceof Error ? error.message : 'Upload failed');
 			notify(error instanceof Error ? error.message : 'Upload failed');
@@ -1764,16 +2550,23 @@
 			});
 			if (!Array.isArray(result.files)) throw new Error(result.message || 'Upload failed');
 			const records = result.files.map(normalizeBackendFile);
-			uploadedImports = [...records, ...uploadedImports];
-			reconcileAssetSelections({
-				preferredMediaId: records.find(isMediaFile)?.id || '',
-				preferredDatasetId: records[0]?.id || ''
+			records.forEach((record, index) => {
+				const mirror = result.files[index]?.localMirror;
+				if (mirror?.cacheId && !record.converted) rememberLocalMirror(record.id, mirror);
 			});
-			notify(`${records.length} ${successLabel}${records.length === 1 ? '' : 's'} uploaded`);
-			finishUploadProgress(
-				`${records.length} ${successLabel}${records.length === 1 ? '' : 's'} uploaded`
+			const recordsWithMirrors = records.map(normalizeBackendFile);
+			uploadedImports = [...recordsWithMirrors, ...uploadedImports];
+			reconcileAssetSelections({
+				preferredMediaId: recordsWithMirrors.find(isMediaFile)?.id || '',
+				preferredDatasetId: recordsWithMirrors[0]?.id || ''
+			});
+			notify(
+				`${recordsWithMirrors.length} ${successLabel}${recordsWithMirrors.length === 1 ? '' : 's'} uploaded`
 			);
-			return records;
+			finishUploadProgress(
+				`${recordsWithMirrors.length} ${successLabel}${recordsWithMirrors.length === 1 ? '' : 's'} uploaded`
+			);
+			return recordsWithMirrors;
 		} catch (error) {
 			failUploadProgress(error instanceof Error ? error.message : 'Upload failed');
 			notify(error instanceof Error ? error.message : 'Upload failed');
@@ -1798,10 +2591,15 @@
 			notify('Paste a Google Drive link');
 			return;
 		}
-		if (send('download_file_google_drive', { url: googleDriveUrl.trim() })) {
+		const sourceUrl = googleDriveUrl.trim();
+		if (send('download_file_google_drive', { url: sourceUrl })) {
+			beginLocalMirrorDownload(sourceUrl, {
+				kind: 'drive',
+				label: 'Google Drive local mirror'
+			});
 			uploadBusy = true;
 			startUploadProgress('drive', 'Google Drive download', 'Waiting for backend');
-			notify('Backend download started');
+			notify('Backend download and local mirror started');
 		}
 	}
 
@@ -1832,6 +2630,11 @@
 	function removeImport(file) {
 		send('delete_file', { file_id: file.id });
 		uploadedImports = uploadedImports.filter((item) => item.id !== file.id);
+		if (localMirrorRecords[file.id]) {
+			const { [file.id]: _removed, ...remaining } = localMirrorRecords;
+			localMirrorRecords = remaining;
+			saveLocalMirrorRecords();
+		}
 		if (selectedImportId === file.id) selectedImportId = mediaAssets()[0]?.id || '';
 		if (selectedDatasetId === file.id) selectedDatasetId = datasetAssets()[0]?.id || '';
 		if (selectedTrainingAnchorId === file.id) selectedTrainingAnchorId = mediaAssets()[0]?.id || '';
@@ -2036,14 +2839,32 @@
 							{#each tasks as task, index (task.id)}
 								<div class="task-row">
 									<strong>{task.name}</strong>
-									<div class="progress-track" aria-label={`${task.name} progress`}>
-										<span style={`width: ${task.progress}%`}></span>
+									<div
+										class="progress-track"
+										role="progressbar"
+										aria-label={`${task.name} progress`}
+										aria-valuemin="0"
+										aria-valuemax="100"
+										aria-valuenow={clampProgress(task.progress)}
+									>
+										<span style={`width: ${clampProgress(task.progress)}%`}></span>
+										<b>{clampProgress(task.progress)}%</b>
 									</div>
 									<small>
 										{task.status}
 										<br /><span class="task-id"
 											>{task.optimistic ? 'Local request' : 'Task'}: {task.id}</span
 										>
+										{#if task.sampling}
+											<br />Sampling {task.sampling.percent}%{#if task.sampling.total}
+												· {task.sampling.done}/{task.sampling.total} frames
+											{/if}
+										{/if}
+										{#if task.sourceVideo}
+											<br />Source video {task.sourceVideo.bytes}{#if task.sourceVideo.total}
+												· {task.sourceVideo.percent}%
+											{/if}
+										{/if}
 										{#if task.chunks?.length}
 											<br />{task.chunks.length} result chunk{task.chunks.length === 1 ? '' : 's'}
 										{/if}
@@ -2241,7 +3062,13 @@
 							<div class="import-list">
 								{#each uploadedImports as file (file.id)}
 									<div class="single-row">
-										<span class="import-name">{file.name}<br /><small>{file.id}</small></span>
+										<span class="import-name">
+											{file.name}<br />
+											<small>
+												{file.id}{#if file.localMirrorReady}
+													· local source ready{/if}
+											</small>
+										</span>
 										<button aria-label={`Remove ${file.name}`} onclick={() => removeImport(file)}
 											>minus</button
 										>
@@ -2468,6 +3295,27 @@
 								{/if}
 							</div>
 						{/if}
+						{#if inferenceLogs.length}
+							<div class="inference-log-panel" aria-live="polite">
+								<div class="inference-log-head">
+									<strong>Website log</strong>
+									<button class="ghost-button" type="button" onclick={clearInferenceLogs}
+										>Clear</button
+									>
+								</div>
+								<div class="inference-log-list">
+									{#each inferenceLogs as entry (entry.id)}
+										<div class:error={entry.level === 'error'}>
+											<span>{entry.time}</span>
+											<strong>{entry.message}</strong>
+											{#if entry.detail}
+												<code>{entry.detail}</code>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							</div>
+						{/if}
 					{:else if activeTab === 'Results'}
 						<div class="section-title-row">
 							<div>
@@ -2491,6 +3339,12 @@
 								type="button"
 								disabled={!selectedExplorerResult()}
 								onclick={() => exportStoredResult()}>Export JSON</button
+							>
+							<button
+								class="ghost-button"
+								type="button"
+								disabled={!selectedExplorerResult() || !isSamResultRecord(selectedExplorerResult())}
+								onclick={() => useResultsForDataset()}>Create Dataset</button
 							>
 							<button
 								class="ghost-button"
@@ -2925,17 +3779,51 @@
 							onclick={startTraining}>Start</button
 						>
 					{:else if activeTab === 'Export'}
+						{@const exportRecords = selectedDatasetSourceRecords()}
+						{@const exportStats = datasetSourceStats(exportRecords)}
+						{@const exportClasses = datasetClassNamesForRecords(exportRecords)}
 						<div class="remote-card">
 							<div class="section-title-row">
 								<div>
 									<h3>Compile YOLO dataset</h3>
 									<p>
-										Turn the streamed SAM results into a YOLO-compatible dataset (images + labels +
-										data.yaml). Each prompt becomes a class.
+										Turn locally stored SAM results into a YOLO-compatible dataset with train/val
+										images, labels, and data.yaml.
 									</p>
 								</div>
-								<span class="status-pill">{liveResults.length} frames</span>
+								<span class="status-pill">{exportStats.frameCount} frames</span>
 							</div>
+							<div class="settings-grid compact">
+								<label
+									>Source results
+									<select bind:value={datasetResultTaskId} disabled={!allSamResultRecords().length}>
+										<option value="latest">Latest SAM task</option>
+										<option value="all">All SAM results</option>
+										{#each samResultTaskOptions() as option (option.id)}
+											<option value={option.id}
+												>{option.name} · {option.frames} frame{option.frames === 1
+													? ''
+													: 's'}</option
+											>
+										{/each}
+									</select></label
+								>
+								<label
+									>Validation split %
+									<input
+										bind:value={datasetValidationPercent}
+										min="0"
+										max="50"
+										step="5"
+										type="number"
+									/></label
+								>
+							</div>
+							<small class="dataset-stat">
+								{exportStats.recordCount} prompt result{exportStats.recordCount === 1 ? '' : 's'} ·
+								{exportStats.boxes} boxes · {exportStats.masks} masks · {exportStats.classCount}
+								classes
+							</small>
 							<div class="export-format">
 								<span class="field-label">Export format</span>
 								<div class="seg-control">
@@ -2966,10 +3854,10 @@
 								<div class="dataset-classes">
 									<span class="field-label">Classes</span>
 									<div class="chips">
-										{#each promptTags as tag, i (tag)}
+										{#each exportClasses as tag, i (tag)}
 											<span>{i}: {tag}</span>
 										{/each}
-										{#if !promptTags.length}<small>Add prompts in the Inference tab</small>{/if}
+										{#if !exportClasses.length}<small>No SAM result classes yet</small>{/if}
 									</div>
 								</div>
 							</div>
@@ -2977,10 +3865,19 @@
 								<button
 									class="primary-action"
 									type="button"
-									disabled={exportingDataset || !liveResults.length || !promptTags.length}
-									onclick={exportYoloDataset}
+									disabled={exportingDataset || !exportRecords.length || !exportClasses.length}
+									onclick={() => exportYoloDataset()}
 								>
-									{exportingDataset ? 'Compiling…' : 'Export dataset (.zip)'}
+									{exportingDataset ? 'Compiling…' : 'Download YOLO zip'}
+								</button>
+								<button
+									class="ghost-button"
+									type="button"
+									disabled={exportingDataset || !exportRecords.length || !exportClasses.length}
+									onclick={() =>
+										exportYoloDataset({ uploadToBackend: true, downloadToBrowser: false })}
+								>
+									Upload zip to backend
 								</button>
 							</div>
 							{#if datasetStats}
@@ -2988,7 +3885,9 @@
 									Last export ({datasetStats.format === 'segment' ? 'segment' : 'detect'}): {datasetStats.frameCount}
 									frames · {datasetStats.labeledFrames} labeled · {datasetStats.boxesTotal}
 									{datasetStats.format === 'segment' ? 'polygons' : 'boxes'} · {datasetStats.classes}
-									classes
+									classes · train {datasetStats.trainFrames} / val {datasetStats.valFrames}
+									{#if datasetStats.skippedFrames}
+										· skipped {datasetStats.skippedFrames} without image{/if}
 								</small>
 							{/if}
 						</div>
@@ -3539,7 +4438,7 @@
 
 	.result-toolbar {
 		display: grid;
-		grid-template-columns: minmax(180px, 1fr) repeat(4, auto);
+		grid-template-columns: minmax(180px, 1fr) repeat(5, auto);
 		gap: 10px;
 		align-items: center;
 		margin: 18px 0;
@@ -3689,6 +4588,7 @@
 	}
 
 	.progress-track {
+		position: relative;
 		height: 14px;
 		background: #dedede;
 		overflow: hidden;
@@ -3698,6 +4598,19 @@
 		display: block;
 		height: 100%;
 		background: #d86f32;
+	}
+
+	.progress-track b {
+		position: absolute;
+		inset: 0;
+		display: grid;
+		place-items: center;
+		color: #2f2f2f;
+		font-size: 0.68rem;
+		font-weight: 700;
+		line-height: 1;
+		pointer-events: none;
+		text-shadow: 0 1px 0 rgba(255, 255, 255, 0.55);
 	}
 
 	.upload-progress {
@@ -4087,6 +5000,67 @@
 			ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
 		font-size: 0.78rem;
 		overflow-wrap: anywhere;
+	}
+
+	.inference-log-panel {
+		display: grid;
+		gap: 10px;
+		margin-top: 14px;
+		border-left: 4px solid #555;
+		background: #f5f5f5;
+		padding: 12px 14px;
+	}
+
+	.inference-log-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+	}
+
+	.inference-log-head .ghost-button {
+		min-width: 72px;
+		height: 30px;
+		padding: 0 12px;
+		font-size: 0.72rem;
+	}
+
+	.inference-log-list {
+		display: grid;
+		gap: 8px;
+		max-height: 260px;
+		overflow: auto;
+		padding-right: 4px;
+	}
+
+	.inference-log-list div {
+		display: grid;
+		grid-template-columns: 82px minmax(150px, 0.85fr) minmax(220px, 1.4fr);
+		gap: 10px;
+		align-items: start;
+		border-bottom: 1px solid #ddd;
+		padding-bottom: 7px;
+		font-size: 0.76rem;
+	}
+
+	.inference-log-list div.error {
+		color: #a13521;
+	}
+
+	.inference-log-list span,
+	.inference-log-list code {
+		font-family:
+			ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+	}
+
+	.inference-log-list span {
+		color: #666;
+	}
+
+	.inference-log-list code {
+		white-space: normal;
+		overflow-wrap: anywhere;
+		color: #333;
 	}
 
 	.dataset-tools {

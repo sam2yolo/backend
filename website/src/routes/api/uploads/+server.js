@@ -1,4 +1,5 @@
 import { json } from '@sveltejs/kit';
+import { storeUploadedMirror } from '$lib/server/localMirror';
 
 function safeBackendUrl(value) {
 	const url = new URL(value);
@@ -21,12 +22,16 @@ export async function POST({ request }) {
 
 		const uploaded = [];
 		for (const file of files) {
+			const mirrorPromise = storeUploadedMirror(file).catch((error) => ({
+				error: error instanceof Error ? error.message : 'Local mirror failed'
+			}));
 			const body = new FormData();
 			body.append('file', file, file.name);
 			const response = await fetch(`${backendUrl}/upload`, { method: 'POST', body });
 			const result = await response.json();
 			if (!response.ok || !result.file_id)
 				throw new Error(result.error || `Backend rejected ${file.name}`);
+			const localMirror = await mirrorPromise;
 			uploaded.push({
 				id: result.file_id,
 				name: result.file_name || file.name,
@@ -34,7 +39,9 @@ export async function POST({ request }) {
 				size: file.size,
 				originalName: result.original_name || file.name,
 				converted: Boolean(result.converted),
-				conversionError: result.conversion_error || ''
+				conversionError: result.conversion_error || '',
+				localMirror: localMirror?.error ? null : localMirror,
+				localMirrorError: localMirror?.error || ''
 			});
 		}
 
