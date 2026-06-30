@@ -13,12 +13,19 @@
 	import { maskToPolygons } from '$lib/contours';
 	import { sampleVideoFrames } from '$lib/videoframes';
 	import { distributeSam, shardIndices } from '$lib/samrun';
+	import {
+		clearInferenceResults,
+		deleteInferenceResult,
+		listInferenceResults,
+		saveInferenceResult
+	} from '$lib/resultstore';
 
 	const tabs = [
 		'Overview',
 		'Remotes',
 		'Import',
 		'Inference',
+		'Results',
 		'Dataset',
 		'Train',
 		'Export',
@@ -122,6 +129,8 @@
 	let inferenceBatch = $state(16);
 	let temporalDownsampling = $state(true);
 	let frameKeepRate = $state(0.05);
+	let inferenceFeedback = $state('');
+	let inferenceFeedbackLevel = $state('info');
 
 	let datasetPath = $state('');
 	let datasetMode = $state('upload');
@@ -149,6 +158,10 @@
 	let originalUrls = $state({}); // file_id -> object URL (for overlay backgrounds)
 	let liveResults = $state([]); // [{ key, taskId, className, frameIndex, result, imgUrl, detections }]
 	let totalDetections = $state(0);
+	let storedResults = $state([]);
+	let selectedStoredResultKey = $state('');
+	let resultTaskFilter = $state('all');
+	let resultStoreStatus = $state('Local result store ready');
 	let exportingDataset = $state(false);
 	let datasetStats = $state(null);
 	let exportFormat = $state('detect'); // 'detect' | 'segment'
@@ -170,6 +183,105 @@
 		return true;
 	}
 
+	function setInferenceFeedback(message, level = 'info', toastMessage = false) {
+		inferenceFeedback = String(message || '');
+		inferenceFeedbackLevel = level;
+		if (toastMessage && message) notify(message);
+	}
+
+	function reportInferenceIssue(message) {
+		setInferenceFeedback(message, 'error', true);
+	}
+
+	function newClientTaskId(prefix = 'task') {
+		return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	}
+
+	function createPendingTask(attrs = {}) {
+		const id = attrs.id || newClientTaskId('request');
+		upsertTask(id, {
+			type: 'inference',
+			status: 'Requested',
+			progress: 1,
+			optimistic: true,
+			clientRequestId: id,
+			...attrs,
+			id
+		});
+		return id;
+	}
+
+	function promoteTaskId(localId, backendId, attrs = {}) {
+		if (!backendId) return;
+		if (!localId || localId === backendId) {
+			upsertTask(backendId, { ...attrs, optimistic: false });
+			return;
+		}
+
+		const localIndex = tasks.findIndex((task) => task.id === localId);
+		const backendIndex = tasks.findIndex((task) => task.id === backendId);
+		if (localIndex === -1) {
+			upsertTask(backendId, { ...attrs, optimistic: false });
+			return;
+		}
+
+		const localTask = tasks[localIndex];
+		const backendTask = backendIndex >= 0 ? tasks[backendIndex] : {};
+		const promoted = {
+			...localTask,
+			...backendTask,
+			...attrs,
+			id: backendId,
+			clientRequestId: localTask.clientRequestId || localId,
+			optimistic: false
+		};
+		tasks = tasks
+			.filter((task, index) => index !== localIndex && task.id !== backendId)
+			.concat(promoted);
+	}
+
+	function latestInferenceTask() {
+		for (let i = tasks.length - 1; i >= 0; i -= 1) {
+			if ((tasks[i].type || 'inference') === 'inference') return tasks[i];
+		}
+		return null;
+	}
+
+	function latestPendingInferenceTaskId() {
+		for (let i = tasks.length - 1; i >= 0; i -= 1) {
+			const task = tasks[i];
+			if (
+				task.optimistic &&
+				(task.type || 'inference') === 'inference' &&
+				!['Completed', 'Failed', 'Cancelled'].includes(task.status)
+			) {
+				return task.id;
+			}
+		}
+		return '';
+	}
+
+	function failInferenceTask(payload = {}, message = 'Backend operation failed') {
+		const taskId =
+			payload.client_request_id ||
+			payload.clientRequestId ||
+			payload.task_id ||
+			payload.id ||
+			latestPendingInferenceTaskId() ||
+			'backend-error';
+		const existing = tasks.find((task) => task.id === taskId);
+		const attrs = {
+			status: 'Failed',
+			progress: 0,
+			optimistic: false
+		};
+		if (!existing) attrs.type = 'inference';
+		if (taskId === 'backend-error') attrs.name = 'Backend error';
+		upsertTask(taskId, attrs);
+		setInferenceFeedback(message, 'error');
+		notify(message);
+	}
+
 	function clampProgress(value) {
 		const number = Number(value);
 		if (!Number.isFinite(number)) return 0;
@@ -187,6 +299,164 @@
 			unit = units[i];
 		}
 		return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${unit}`;
+	}
+
+	function detectionCount(result = {}) {
+		if (Number.isFinite(Number(result.detections))) return Number(result.detections);
+		if (Array.isArray(result.boxes)) return result.boxes.length;
+		if (Array.isArray(result.masks)) return result.masks.length;
+		if (Array.isArray(result.scores)) return result.scores.length;
+		return 0;
+	}
+
+	function resultClassLabel(result = {}, fallback = 'objects') {
+		const classNames = [...new Set((result.class_names || []).filter(Boolean))];
+		if (classNames.length) return classNames.slice(0, 3).join(', ');
+		return fallback || result.kind || 'objects';
+	}
+
+	function taskDisplayName(taskId) {
+		return tasks.find((task) => task.id === taskId)?.name || taskId || 'Inference result';
+	}
+
+	function blobToDataUrl(blob) {
+		return new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result || ''));
+			reader.onerror = () => reject(reader.error || new Error('Could not read image'));
+			reader.readAsDataURL(blob);
+		});
+	}
+
+	async function imageDataUrlFromUrl(url) {
+		if (!url || url.startsWith('data:')) return url || '';
+		const response = await fetch(url);
+		if (!response.ok) throw new Error('Could not persist result image');
+		return blobToDataUrl(await response.blob());
+	}
+
+	async function refreshStoredResults() {
+		try {
+			const records = await listInferenceResults();
+			storedResults = records;
+			resultStoreStatus = `${records.length} locally stored result${records.length === 1 ? '' : 's'}`;
+			if (!selectedStoredResultKey && records[0]) selectedStoredResultKey = records[0].key;
+		} catch (error) {
+			resultStoreStatus = error?.message || 'Local result store unavailable';
+		}
+	}
+
+	function rememberVisualResult(item) {
+		const result = item.result || {};
+		const detections = item.detections ?? detectionCount(result);
+		const recordBase = {
+			key: item.key,
+			taskId: item.taskId || '',
+			taskName: item.taskName || taskDisplayName(item.taskId),
+			chunkId: item.chunkId || '',
+			model: item.model || result.kind || loadedModelType || inferenceModel,
+			className: item.className || resultClassLabel(result),
+			frameIndex: item.frameIndex ?? 0,
+			fileId: item.fileId || '',
+			fileName: item.fileName || '',
+			detections,
+			result,
+			createdAt: new Date().toISOString()
+		};
+
+		const save = async () => {
+			const imageDataUrl =
+				item.imageDataUrl || result.image_data_url || (await imageDataUrlFromUrl(item.imgUrl));
+			const record = { ...recordBase, imageDataUrl };
+			await saveInferenceResult(record);
+			storedResults = [
+				record,
+				...storedResults.filter((existing) => existing.key !== record.key)
+			].slice(0, 600);
+			if (!selectedStoredResultKey) selectedStoredResultKey = record.key;
+			resultStoreStatus = `Saved ${storedResults.length} result${
+				storedResults.length === 1 ? '' : 's'
+			} locally`;
+			if (record.taskId) {
+				const task = tasks.find((candidate) => candidate.id === record.taskId);
+				upsertTask(record.taskId, {
+					localResultCount: (task?.localResultCount || 0) + 1,
+					status: task?.status === 'Completed' ? 'Completed' : task?.status || 'Storing results'
+				});
+			}
+		};
+
+		save().catch((error) => {
+			resultStoreStatus = error?.message || 'Local result save failed';
+		});
+	}
+
+	function addLiveResult(item, limit = 300) {
+		const resultItem = {
+			...item,
+			detections: item.detections ?? detectionCount(item.result)
+		};
+		totalDetections += resultItem.detections;
+		liveResults = [resultItem, ...liveResults].slice(0, limit);
+		rememberVisualResult(resultItem);
+	}
+
+	function resultTaskOptions() {
+		const seen = new Map();
+		for (const result of storedResults) {
+			if (!result.taskId || seen.has(result.taskId)) continue;
+			seen.set(result.taskId, result.taskName || result.taskId);
+		}
+		return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
+	}
+
+	function explorerResults() {
+		if (resultTaskFilter === 'all') return storedResults;
+		return storedResults.filter((result) => result.taskId === resultTaskFilter);
+	}
+
+	function selectedExplorerResult() {
+		const visible = explorerResults();
+		return (
+			visible.find((result) => result.key === selectedStoredResultKey) ||
+			visible[0] ||
+			storedResults[0] ||
+			null
+		);
+	}
+
+	function exportStoredResult(record = selectedExplorerResult()) {
+		if (!record) return;
+		const blob = new Blob([JSON.stringify(record, null, 2)], { type: 'application/json' });
+		const url = URL.createObjectURL(blob);
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = `inference-${record.key}.json`;
+		link.click();
+		URL.revokeObjectURL(url);
+	}
+
+	async function removeStoredResult(record = selectedExplorerResult()) {
+		if (!record) return;
+		try {
+			await deleteInferenceResult(record.key);
+			storedResults = storedResults.filter((item) => item.key !== record.key);
+			selectedStoredResultKey = explorerResults()[0]?.key || storedResults[0]?.key || '';
+			resultStoreStatus = 'Result deleted';
+		} catch (error) {
+			notify(error?.message || 'Could not delete result');
+		}
+	}
+
+	async function clearStoredResultRecords() {
+		try {
+			await clearInferenceResults();
+			storedResults = [];
+			selectedStoredResultKey = '';
+			resultStoreStatus = 'Local results cleared';
+		} catch (error) {
+			notify(error?.message || 'Could not clear results');
+		}
 	}
 
 	function startUploadProgress(kind, label, detail = 'Preparing upload') {
@@ -481,18 +751,22 @@
 					break;
 				case 'model_setup_started':
 					modelState = 'Preparing environment';
+					setInferenceFeedback('Preparing model environment');
 					break;
 				case 'model_setup_completed':
 					modelState = 'Loading weights';
+					setInferenceFeedback('Loading model weights');
 					break;
 				case 'model_init_started':
 					modelState = `Loading ${payload.model_name || modelVariant}`;
+					setInferenceFeedback(modelState);
 					break;
 				case 'model_init_completed':
 					modelReady = true;
 					loadedModelType = requestedModelType || loadedModelType;
 					modelState = payload.model_name || loadedModelType || modelVariant;
 					notify(`${modelState} is ready`);
+					setInferenceFeedback(`${modelState} is ready. Creating queued task.`);
 					queuePendingTasks();
 					break;
 				case 'model_setup_error':
@@ -500,6 +774,12 @@
 					modelReady = false;
 					modelState = 'Failed';
 					pendingTasks = [];
+					{
+						const pendingId = latestPendingInferenceTaskId();
+						if (pendingId)
+							upsertTask(pendingId, { status: 'Failed', progress: 0, optimistic: false });
+					}
+					setInferenceFeedback(errorMessage(payload), 'error');
 					notify(errorMessage(payload));
 					break;
 				case 'file_download_initiated':
@@ -547,42 +827,60 @@
 					notify(errorMessage(payload));
 					break;
 				case 'task_added':
-					upsertTask(payload.id, {
-						name:
-							payload.name ||
-							(payload.type === 'train' ? 'YOLO training' : selectedImport()?.name) ||
-							payload.id,
-						status: 'Queued',
-						progress: 0,
-						type: payload.type || 'inference',
-						// remember enough to map chunk results back to source frames
-						file_ids: payload.file_ids || (payload.file_id ? [payload.file_id] : []),
-						batch: payload.batch || 1,
-						className: payload.class_name || payload.text_prompt || null
-					});
+					{
+						const clientTaskId = payload.client_request_id || payload.clientRequestId || '';
+						const taskAttrs = {
+							name:
+								payload.name ||
+								(payload.type === 'train' ? 'YOLO training' : selectedImport()?.name) ||
+								payload.id,
+							status: 'Queued',
+							progress: 0,
+							type: payload.type || 'inference',
+							model: payload.model || loadedModelType || inferenceModel,
+							// remember enough to map chunk results back to source frames
+							file_ids: payload.file_ids || (payload.file_id ? [payload.file_id] : []),
+							batch: payload.batch || 1,
+							className: payload.class_name || payload.text_prompt || null
+						};
+						promoteTaskId(clientTaskId, payload.id, taskAttrs);
+					}
+					if ((payload.type || 'inference') === 'inference') {
+						setInferenceFeedback(`Task ${payload.id} queued. Starting backend worker.`);
+					}
 					send('start_inference_from_queue');
 					break;
 				case 'work_started':
+					setInferenceFeedback('Backend worker started. Inference is running.');
 					notify('Backend worker started');
+					break;
+				case 'already_working':
+					setInferenceFeedback('Backend is already processing. This task will run from the queue.');
+					break;
+				case 'queue_empty':
+					setInferenceFeedback('Backend queue is empty', 'error');
 					break;
 				case 'inference_stage_plus_progress':
 					upsertTask(id, {
 						status: payload.stage || 'Inferencing',
 						progress: payload.progress ?? 0
 					});
+					setInferenceFeedback(
+						`${payload.stage || 'Inferencing'} ${payload.progress == null ? '' : `${clampProgress(payload.progress)}%`}`.trim()
+					);
 					break;
 				case 'inference_task_chunk_result': {
 					const current = tasks.find((task) => task.id === payload.task_id);
 					const chunks = [...(current?.chunks || []), payload.chunk_id];
-					upsertTask(payload.task_id, { chunks });
-					// Pull the chunk's JSON so we can render masks live (SAM only —
-					// SAM chunk data is plain JSON; YOLO chunks are pickled objects).
-					if (current?.className != null || loadedModelType === 'sam') {
-						send('fetch_inference_chunk', {
-							task_id: payload.task_id,
-							chunk_id: payload.chunk_id
-						});
-					}
+					upsertTask(payload.task_id, {
+						chunks,
+						status: current?.status || `Received ${chunks.length} result chunk(s)`
+					});
+					setInferenceFeedback(`Result chunk ${chunks.length} received. Saving locally.`);
+					send('fetch_inference_chunk', {
+						task_id: payload.task_id,
+						chunk_id: payload.chunk_id
+					});
 					break;
 				}
 				case 'inference_chunk_data':
@@ -590,6 +888,7 @@
 					break;
 				case 'inference_completed':
 					upsertTask(id, { status: 'Completed', progress: 100 });
+					setInferenceFeedback('Inference completed', 'success');
 					notify('Traffic inference completed');
 					break;
 				case 'training_started':
@@ -603,8 +902,8 @@
 				case 'inference_task_error':
 				case 'create_inference_task_error':
 				case 'create_infrerence_task_error':
-					upsertTask(id || 'backend-error', { status: 'Failed', progress: 0 });
-					notify(errorMessage(payload));
+				case 'model_handler_not_loaded_error':
+					failInferenceTask(payload, errorMessage(payload));
 					break;
 				case 'task_cancelled':
 					upsertTask(id, { status: 'Cancelled' });
@@ -738,25 +1037,35 @@
 
 	function ensureModel(modelType, taskList) {
 		if (connectionState !== 'Connected') {
-			notify('Connect to the backend first');
-			return;
+			reportInferenceIssue('Connect to the backend first');
+			return false;
 		}
 		pendingTasks = Array.isArray(taskList) ? taskList : [taskList];
 		// Reuse the loaded model only if it's the same type and ready.
 		if (modelReady && loadedModelType === modelType) {
 			queuePendingTasks();
-			return;
+			return true;
 		}
 		modelReady = false;
 		requestedModelType = modelType;
 		modelState = 'Starting';
+		setInferenceFeedback(
+			`Starting ${modelType === 'sam' ? 'SAM' : 'YOLO'} model. Your task is listed while the worker prepares.`
+		);
 		if (modelType === 'sam') {
-			send('init_model', { model_name: 'sam', base_url: samBaseUrl });
+			if (!send('init_model', { model_name: 'sam', base_url: samBaseUrl })) {
+				pendingTasks = [];
+				return false;
+			}
 			notify('Initializing SAM 3.1 on the worker');
 		} else {
-			send('init_model', { model_name: 'yolo', variant_name: modelVariant });
+			if (!send('init_model', { model_name: 'yolo', variant_name: modelVariant })) {
+				pendingTasks = [];
+				return false;
+			}
 			notify('Preparing the YOLO environment; the first run can take longer');
 		}
+		return true;
 	}
 
 	function addPrompt() {
@@ -785,13 +1094,26 @@
 		if (!pendingTasks.length) return;
 		const queue = pendingTasks;
 		pendingTasks = [];
-		for (const task of queue) send('create_inference_task', task);
+		for (const task of queue) {
+			if (task.client_request_id) {
+				upsertTask(task.client_request_id, {
+					status: 'Creating backend task',
+					progress: Math.max(
+						5,
+						tasks.find((item) => item.id === task.client_request_id)?.progress || 0
+					)
+				});
+			}
+			if (!send('create_inference_task', task) && task.client_request_id) {
+				upsertTask(task.client_request_id, { status: 'Failed', progress: 0, optimistic: false });
+			}
+		}
 	}
 
 	function startInference() {
 		const file = selectedImport();
 		if (!file) {
-			notify('Select a backend import first');
+			reportInferenceIssue('Select a backend import first');
 			return;
 		}
 
@@ -803,8 +1125,22 @@
 		const classes = [
 			...new Set(promptTags.map((tag) => cocoVehicleClasses[tag]).filter(Number.isInteger))
 		];
-		ensureModel('yolo', {
+		const requestId = createPendingTask({
+			id: newClientTaskId('yolo'),
+			name: `YOLO · ${file.name}`,
+			status:
+				modelReady && loadedModelType === 'yolo'
+					? 'Creating backend task'
+					: 'Waiting for YOLO model',
+			progress: 2,
+			model: 'yolo',
+			file_ids: [file.id]
+		});
+		setInferenceFeedback(`Request ${requestId} created. Waiting for backend task id.`);
+		const accepted = ensureModel('yolo', {
+			client_request_id: requestId,
 			name: `Traffic · ${file.name}`,
+			model: 'yolo',
 			file_id: file.id,
 			file_ids: [file.id],
 			file_type: detectFileType(file.name),
@@ -816,6 +1152,7 @@
 			temporal_downsampling: temporalDownsampling,
 			drop_rate: Number(frameKeepRate)
 		});
+		if (!accepted) upsertTask(requestId, { status: 'Failed', progress: 0, optimistic: false });
 	}
 
 	// Upload an array of Blobs (e.g. sampled video frames) as images; returns the
@@ -839,33 +1176,58 @@
 	// frames in the browser first.
 	async function startSamInference(file) {
 		if (!promptTags.length) {
-			notify('Add at least one text prompt for SAM');
+			reportInferenceIssue('Add at least one text prompt for SAM');
 			return;
 		}
+
+		const requestId = createPendingTask({
+			id: newClientTaskId('sam'),
+			name: `SAM · ${promptTags.join(', ')}`,
+			status: 'Preparing SAM request',
+			progress: 1,
+			model: 'sam',
+			file_ids: [file.id],
+			className: promptTags.join(', ')
+		});
+		setInferenceFeedback(`Request ${requestId} created. Preparing SAM input.`);
 
 		let fileIds;
 		if (detectFileType(file.name) === 'image') {
 			fileIds = [file.id];
 		} else {
 			if (isDavFile(file)) {
-				notify('DAV files can be selected for YOLO; convert to MP4 before using SAM sampling');
+				failInferenceTask(
+					{ id: requestId },
+					'DAV files can be selected for YOLO; convert to MP4 before using SAM sampling'
+				);
 				return;
 			}
 			try {
 				if (!originalUrls[file.id]) {
 					modelState = 'Loading source video';
+					upsertTask(requestId, { status: 'Loading source video', progress: 4 });
 					notify('Loading source video from backend');
 				}
 				const videoUrl = await ensureOriginalUrl(file);
+				upsertTask(requestId, { status: `Sampling video at ${samFps} fps`, progress: 6 });
+				setInferenceFeedback('Sampling video frames for SAM');
 				notify(`Sampling video at ${samFps} fps…`);
 				const frames = await sampleVideoFrames(
 					videoUrl,
 					Number(samFps),
 					Number(samMaxFrames) || 0,
-					(done, total) => (modelState = `Sampling ${done}/${total}`)
+					(done, total) => {
+						modelState = `Sampling ${done}/${total}`;
+						const progress = total ? 6 + Math.round((done / total) * 24) : 10;
+						upsertTask(requestId, {
+							status: `Sampling frames ${done}/${total}`,
+							progress: Math.min(30, progress)
+						});
+						setInferenceFeedback(`Sampling frames ${done}/${total}`);
+					}
 				);
 				if (!frames.length) {
-					notify('No frames sampled from video');
+					failInferenceTask({ id: requestId }, 'No frames sampled from video');
 					return;
 				}
 				const blobs = frames.map((f) => f.blob);
@@ -880,6 +1242,11 @@
 
 				if (pool.length) {
 					const shards = shardIndices(frames.length, pool.length);
+					upsertTask(requestId, {
+						status: `Uploading ${frames.length} frames to ${shards.length} worker(s)`,
+						progress: 32
+					});
+					setInferenceFeedback(`Uploading ${frames.length} sampled frames across workers`);
 					notify(`Uploading ${frames.length} frames across ${shards.length} worker(s)…`);
 					const assignments = [];
 					const urls = {};
@@ -889,6 +1256,10 @@
 						const shardBlobs = indices.map((idx) => blobs[idx]);
 						const shardNames = indices.map((idx) => names[idx]);
 						modelState = `Uploading shard ${i + 1}/${shards.length} to ${w.name}`;
+						upsertTask(requestId, {
+							status: `Uploading shard ${i + 1}/${shards.length}`,
+							progress: 32 + Math.round((i / Math.max(1, shards.length)) * 18)
+						});
 						const uploaded = await uploadBlobs(
 							shardBlobs,
 							shardNames,
@@ -910,12 +1281,17 @@
 					runDistributedSam(
 						assignments.map((a) => ({ name: a.name, ws_url: a.ws_url })),
 						null,
-						{ assignments, totalFrames: frames.length }
+						{ assignments, totalFrames: frames.length, jobId: requestId }
 					);
 					return;
 				}
 
 				// No fleet workers selected — upload everything to the single backend.
+				upsertTask(requestId, {
+					status: `Uploading ${frames.length} sampled frames`,
+					progress: 32
+				});
+				setInferenceFeedback(`Uploading ${frames.length} sampled frames`);
 				notify(`Uploading ${frames.length} sampled frames…`);
 				const uploaded = await uploadBlobs(blobs, names, backendUrl, 'Sampled frame upload');
 				fileIds = uploaded.map((u) => u.id);
@@ -924,7 +1300,7 @@
 				originalUrls = { ...originalUrls, ...urls };
 			} catch (error) {
 				if (uploadProgress.active) failUploadProgress(error?.message || 'Frame upload failed');
-				notify(error?.message || 'Video sampling failed');
+				failInferenceTask({ id: requestId }, error?.message || 'Video sampling failed');
 				return;
 			}
 		}
@@ -937,14 +1313,14 @@
 		};
 		liveResults = [];
 		totalDetections = 0;
-		runDistributedSam([backendWorker], fileIds);
+		runDistributedSam([backendWorker], fileIds, { jobId: requestId });
 	}
 
 	// Orchestrate a distributed SAM run across workers and stream results into the
 	// live view + a task-project row. The global socket is freed during the run
 	// (each worker allows a single WebSocket) and reconnected afterwards.
 	function runDistributedSam(workers, fileIds, extra = {}) {
-		const { assignments = null, totalFrames = null } = extra;
+		const { assignments = null, totalFrames = null, jobId: existingJobId = '' } = extra;
 		const prompts = promptTags.slice();
 		const frameCount = assignments
 			? (totalFrames ?? assignments.reduce((n, a) => n + a.fileIds.length, 0))
@@ -952,13 +1328,16 @@
 		const workerCount = assignments ? assignments.length : workers.length;
 		const totalUnits = frameCount * prompts.length;
 		let doneUnits = 0;
-		const jobId = 'sam-' + Date.now().toString(36);
+		const jobId = existingJobId || 'sam-' + Date.now().toString(36);
 		upsertTask(jobId, {
 			name: `SAM · ${prompts.join(', ')}`,
-			status: `Running on ${workerCount} worker${workerCount === 1 ? '' : 's'}`,
-			progress: 0,
-			type: 'inference'
+			status: `Starting on ${workerCount} worker${workerCount === 1 ? '' : 's'}`,
+			progress: Math.max(35, tasks.find((task) => task.id === jobId)?.progress || 0),
+			type: 'inference',
+			model: 'sam',
+			optimistic: true
 		});
+		setInferenceFeedback(`SAM request ${jobId} is starting on ${workerCount} worker(s).`);
 
 		const hadSocket = socket && socket.readyState === WebSocket.OPEN;
 		socket?.close?.();
@@ -976,33 +1355,42 @@
 				onEvent: (e) => {
 					if (e.type === 'status') {
 						modelState = `${e.worker}: ${e.message}`;
+						upsertTask(jobId, {
+							status: `${e.worker}: ${e.message}`,
+							progress: Math.max(40, tasks.find((task) => task.id === jobId)?.progress || 0)
+						});
+						setInferenceFeedback(`${e.worker}: ${e.message}`);
 					} else if (e.type === 'frame') {
 						const detections = (e.result.masks || []).length;
-						totalDetections += detections;
 						doneUnits += 1;
 						upsertTask(jobId, {
 							progress: Math.round((doneUnits / Math.max(1, totalUnits)) * 100),
-							status: `Running · ${doneUnits}/${totalUnits}`
+							status: `Running · ${doneUnits}/${totalUnits}`,
+							optimistic: false
 						});
-						liveResults = [
-							{
-								key: `${e.taskId}-${e.frameIndex}-${e.className}`,
-								taskId: e.taskId,
-								className: e.className || 'objects',
-								frameIndex: e.frameIndex,
-								result: e.result,
-								imgUrl: e.fileId ? originalUrls[e.fileId] : null,
-								detections
-							},
-							...liveResults
-						].slice(0, 300);
+						setInferenceFeedback(`SAM running ${doneUnits}/${totalUnits}`);
+						addLiveResult({
+							key: `${e.taskId}-${e.frameIndex}-${e.className}`,
+							taskId: jobId,
+							chunkId: e.taskId,
+							model: 'sam',
+							className: e.className || 'objects',
+							frameIndex: e.frameIndex,
+							fileId: e.fileId || '',
+							result: e.result,
+							imgUrl: e.fileId ? originalUrls[e.fileId] : null,
+							detections
+						});
 					} else if (e.type === 'error') {
+						upsertTask(jobId, { status: `Worker warning: ${e.message}` });
+						setInferenceFeedback(`${e.worker}: ${e.message}`, 'error');
 						notify(`${e.worker}: ${e.message}`);
 					}
 				}
 			});
 		} catch (error) {
-			upsertTask(jobId, { status: 'Failed' });
+			upsertTask(jobId, { status: 'Failed', optimistic: false });
+			setInferenceFeedback(error?.message || 'Could not start SAM run', 'error');
 			notify(error?.message || 'Could not start SAM run');
 			if (hadSocket) connectBackend();
 			return;
@@ -1010,12 +1398,14 @@
 
 		job.promise
 			.then(() => {
-				upsertTask(jobId, { status: 'Completed', progress: 100 });
+				upsertTask(jobId, { status: 'Completed', progress: 100, optimistic: false });
 				modelState = 'SAM complete';
+				setInferenceFeedback('SAM inference complete', 'success');
 				notify('SAM inference complete');
 			})
 			.catch((error) => {
-				upsertTask(jobId, { status: 'Failed' });
+				upsertTask(jobId, { status: 'Failed', optimistic: false });
+				setInferenceFeedback(error?.message || 'SAM run failed', 'error');
 				notify(error?.message || 'SAM run failed');
 			})
 			.finally(() => {
@@ -1023,30 +1413,39 @@
 			});
 	}
 
-	// Turn a fetched SAM chunk into renderable live-result tiles.
+	// Turn a fetched chunk into renderable live-result tiles.
 	function ingestChunkData(payload) {
 		const task = tasks.find((t) => t.id === payload.task_id);
 		const images = payload.data?.images || [];
+		const model = payload.data?.kind || task?.model || loadedModelType || inferenceModel;
 		const batch = task?.batch || 1;
 		const fileIds = task?.file_ids || [];
-		const className = task?.className || 'objects';
+		const selectedFile = selectedImport();
+		const className = task?.className || (model === 'yolo' ? 'YOLO' : 'objects');
 		const chunkIndex = payload.chunk_index ?? 0;
 		const additions = images.map((result, j) => {
 			const globalIdx = chunkIndex * batch + j;
 			const fileId = fileIds[globalIdx];
-			const detections = (result.masks || []).length;
-			totalDetections += detections;
+			const detections = detectionCount(result);
 			return {
 				key: `${payload.task_id}-${payload.chunk_id}-${j}`,
 				taskId: payload.task_id,
-				className,
+				chunkId: payload.chunk_id,
+				model,
+				className: resultClassLabel(result, className),
 				frameIndex: globalIdx,
+				fileId: fileId || '',
+				fileName: selectedFile?.name || '',
 				result,
-				imgUrl: fileId ? originalUrls[fileId] : null,
+				imgUrl: result.image_data_url || (fileId ? originalUrls[fileId] : null),
+				imageDataUrl: result.image_data_url || '',
 				detections
 			};
 		});
-		liveResults = [...additions, ...liveResults].slice(0, 200);
+		additions.reverse().forEach((item) => addLiveResult(item, 300));
+		if (additions.length) {
+			setInferenceFeedback(`Saved ${additions.length} result frame(s) locally.`);
+		}
 	}
 
 	// Svelte action: paint a SAM result onto a <canvas>, over its source image.
@@ -1248,6 +1647,7 @@
 		} else {
 			createFleetRoom({ auto: true });
 		}
+		refreshStoredResults();
 		connectBackend();
 	});
 
@@ -1641,8 +2041,14 @@
 									</div>
 									<small>
 										{task.status}
+										<br /><span class="task-id"
+											>{task.optimistic ? 'Local request' : 'Task'}: {task.id}</span
+										>
 										{#if task.chunks?.length}
 											<br />{task.chunks.length} result chunk{task.chunks.length === 1 ? '' : 's'}
+										{/if}
+										{#if task.localResultCount}
+											<br />{task.localResultCount} stored locally
 										{/if}
 									</small>
 									<button aria-label={`Delete ${task.name}`} onclick={() => removeTask(index)}
@@ -2045,6 +2451,124 @@
 								onclick={startInference}>Start</button
 							>
 						</div>
+						{@const latestTask = latestInferenceTask()}
+						{#if inferenceFeedback || latestTask}
+							<div
+								class="inference-feedback"
+								class:error={inferenceFeedbackLevel === 'error'}
+								class:success={inferenceFeedbackLevel === 'success'}
+								aria-live="polite"
+							>
+								<strong>{inferenceFeedback || latestTask.status}</strong>
+								{#if latestTask}
+									<span>
+										{latestTask.optimistic ? 'Local request' : 'Task'}: {latestTask.id}
+										{latestTask.optimistic ? ' · waiting for backend id' : ''}
+									</span>
+								{/if}
+							</div>
+						{/if}
+					{:else if activeTab === 'Results'}
+						<div class="section-title-row">
+							<div>
+								<h2>Inference Results</h2>
+								<small>{resultStoreStatus}</small>
+							</div>
+							<span class="status-pill">{storedResults.length} local</span>
+						</div>
+
+						<div class="result-toolbar">
+							<select bind:value={resultTaskFilter}>
+								<option value="all">All tasks</option>
+								{#each resultTaskOptions() as option (option.id)}
+									<option value={option.id}>{option.name}</option>
+								{/each}
+							</select>
+							<button class="ghost-button" type="button" onclick={refreshStoredResults}>Sync</button
+							>
+							<button
+								class="ghost-button"
+								type="button"
+								disabled={!selectedExplorerResult()}
+								onclick={() => exportStoredResult()}>Export JSON</button
+							>
+							<button
+								class="ghost-button"
+								type="button"
+								disabled={!selectedExplorerResult()}
+								onclick={() => removeStoredResult()}>Delete</button
+							>
+							<button
+								class="ghost-button"
+								type="button"
+								disabled={!storedResults.length}
+								onclick={clearStoredResultRecords}>Clear</button
+							>
+						</div>
+
+						{#if explorerResults().length}
+							{@const selectedResult = selectedExplorerResult()}
+							<div class="result-explorer">
+								<div class="result-browser" aria-label="Stored inference results">
+									{#each explorerResults() as item (item.key)}
+										<button
+											class:selected={selectedResult?.key === item.key}
+											type="button"
+											onclick={() => (selectedStoredResultKey = item.key)}
+										>
+											<strong>{item.className}</strong>
+											<small>
+												{item.taskName}<br />
+												frame {item.frameIndex} · {item.detections} det · {item.model}
+											</small>
+										</button>
+									{/each}
+								</div>
+
+								<div class="result-inspector">
+									{#if selectedResult}
+										<div class="section-title-row result-inspector-head">
+											<div>
+												<h3>{selectedResult.className}</h3>
+												<small>{selectedResult.taskName}</small>
+											</div>
+											<span class="status-pill">{selectedResult.detections} det</span>
+										</div>
+										<figure class="result-inspector-canvas">
+											<canvas
+												use:drawResult={{
+													result: selectedResult.result,
+													imgUrl:
+														selectedResult.imageDataUrl ||
+														selectedResult.result?.image_data_url ||
+														''
+												}}
+											></canvas>
+										</figure>
+										<div class="result-meta-grid">
+											<div>
+												<span>Task</span>
+												<strong>{selectedResult.taskId}</strong>
+											</div>
+											<div>
+												<span>Frame</span>
+												<strong>{selectedResult.frameIndex}</strong>
+											</div>
+											<div>
+												<span>Boxes</span>
+												<strong>{selectedResult.result?.boxes?.length || 0}</strong>
+											</div>
+											<div>
+												<span>Stored</span>
+												<strong>{new Date(selectedResult.createdAt).toLocaleString()}</strong>
+											</div>
+										</div>
+									{/if}
+								</div>
+							</div>
+						{:else}
+							<p class="empty-imports">No locally stored inference results yet.</p>
+						{/if}
 					{:else if activeTab === 'Dataset'}
 						<div class="section-title-row dataset-hero">
 							<div>
@@ -3013,6 +3537,113 @@
 		background: #3a3a3a;
 	}
 
+	.result-toolbar {
+		display: grid;
+		grid-template-columns: minmax(180px, 1fr) repeat(4, auto);
+		gap: 10px;
+		align-items: center;
+		margin: 18px 0;
+	}
+
+	.result-toolbar .ghost-button {
+		min-width: 96px;
+	}
+
+	.result-explorer {
+		display: grid;
+		grid-template-columns: minmax(210px, 0.36fr) minmax(0, 1fr);
+		gap: 16px;
+		min-height: 420px;
+	}
+
+	.result-browser {
+		display: grid;
+		align-content: start;
+		gap: 8px;
+		max-height: 580px;
+		overflow: auto;
+		padding-right: 4px;
+	}
+
+	.result-browser button {
+		display: grid;
+		gap: 4px;
+		width: 100%;
+		border: 1px solid #ddd;
+		border-left: 4px solid transparent;
+		border-radius: 6px;
+		background: #fff;
+		padding: 10px;
+		text-align: left;
+	}
+
+	.result-browser button.selected {
+		border-left-color: #d86f32;
+		box-shadow: 0 8px 20px rgba(0, 0, 0, 0.06);
+	}
+
+	.result-browser small,
+	.result-inspector small {
+		color: #666;
+		line-height: 1.4;
+		overflow-wrap: anywhere;
+	}
+
+	.result-inspector {
+		display: grid;
+		align-content: start;
+		gap: 12px;
+		border: 1px solid #ddd;
+		border-radius: 8px;
+		background: #fff;
+		padding: 14px;
+	}
+
+	.result-inspector-head {
+		align-items: start;
+	}
+
+	.result-inspector-canvas {
+		margin: 0;
+		border-radius: 6px;
+		background: #0d0d0d;
+		overflow: hidden;
+	}
+
+	.result-inspector-canvas canvas {
+		display: block;
+		width: 100%;
+		height: auto;
+		max-height: 520px;
+		object-fit: contain;
+		background: #050505;
+	}
+
+	.result-meta-grid {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 8px;
+	}
+
+	.result-meta-grid div {
+		display: grid;
+		gap: 3px;
+		border-radius: 5px;
+		background: #f4f4f4;
+		padding: 9px;
+		min-width: 0;
+	}
+
+	.result-meta-grid span {
+		color: #777;
+		font-size: 0.72rem;
+	}
+
+	.result-meta-grid strong {
+		font-size: 0.76rem;
+		overflow-wrap: anywhere;
+	}
+
 	.dataset-classes .chips {
 		margin-top: 6px;
 	}
@@ -3381,6 +4012,14 @@
 		color: #333;
 	}
 
+	.task-id {
+		color: #666;
+		font-family:
+			ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+		font-size: 0.72rem;
+		overflow-wrap: anywhere;
+	}
+
 	.settings-grid {
 		align-items: end;
 		margin-top: 22px;
@@ -3421,6 +4060,33 @@
 	.upload-card button:disabled {
 		cursor: not-allowed;
 		opacity: 0.58;
+	}
+
+	.inference-feedback {
+		display: grid;
+		gap: 4px;
+		margin-top: 16px;
+		border-left: 4px solid #315b97;
+		background: #f7f9fc;
+		padding: 12px 14px;
+		color: #222;
+	}
+
+	.inference-feedback.success {
+		border-left-color: #248a53;
+		background: #f3fbf6;
+	}
+
+	.inference-feedback.error {
+		border-left-color: #c94a2d;
+		background: #fff5f1;
+	}
+
+	.inference-feedback span {
+		font-family:
+			ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+		font-size: 0.78rem;
+		overflow-wrap: anywhere;
 	}
 
 	.dataset-tools {

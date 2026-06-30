@@ -2,9 +2,18 @@
 import { inflate } from 'pako';
 
 export const PALETTE = [
-	[255, 59, 48], [52, 199, 89], [0, 122, 255], [255, 204, 0],
-	[175, 82, 222], [255, 149, 0], [90, 200, 250], [255, 45, 85],
-	[100, 210, 80], [191, 90, 242], [255, 105, 97], [48, 176, 199]
+	[255, 59, 48],
+	[52, 199, 89],
+	[0, 122, 255],
+	[255, 204, 0],
+	[175, 82, 222],
+	[255, 149, 0],
+	[90, 200, 250],
+	[255, 45, 85],
+	[100, 210, 80],
+	[191, 90, 242],
+	[255, 105, 97],
+	[48, 176, 199]
 ];
 
 /** Decode one SAM mask object → { h, w, bits:Uint8Array(h*w) of 0/1 }. */
@@ -67,6 +76,27 @@ export function renderResult(canvas, img, result, { alpha = 0.45 } = {}) {
 			}
 		}
 		ctx.putImageData(frame, 0, 0);
+	}
+
+	const polygons = result.polygons || result.segments || [];
+	if (polygons.length) {
+		for (let pi = 0; pi < polygons.length; pi++) {
+			const points = polygons[pi] || [];
+			if (points.length < 3) continue;
+			const c = PALETTE[pi % PALETTE.length];
+			ctx.beginPath();
+			points.forEach((point, index) => {
+				const [x, y] = point;
+				if (index === 0) ctx.moveTo(x, y);
+				else ctx.lineTo(x, y);
+			});
+			ctx.closePath();
+			ctx.fillStyle = `rgba(${c[0]}, ${c[1]}, ${c[2]}, 0.22)`;
+			ctx.strokeStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+			ctx.lineWidth = Math.max(1, w / 520);
+			ctx.fill();
+			ctx.stroke();
+		}
 	}
 
 	const boxes = result.boxes || [];

@@ -10,6 +10,8 @@ files/
 !website/src/routes/api/files/
 !website/src/routes/api/files/+server.js
 results/
+!website/src/routes/api/results/
+!website/src/routes/api/results/+server.js
 *.pt
 
 .solve/

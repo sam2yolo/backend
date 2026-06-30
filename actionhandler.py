@@ -1,4 +1,5 @@
 import json
+import base64
 from multiprocessing import context
 import asyncio
 import subprocess
@@ -63,6 +64,108 @@ from video_utils import maybe_convert_dav, storage_path_for_file
 
 
 handlers: Dict[str, Callable[[WebSocket, dict, Context], Awaitable[None]]] = {}
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _array_like_to_list(value):
+    if value is None:
+        return []
+    try:
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+        if hasattr(value, "tolist"):
+            return _json_safe(value.tolist())
+        return _json_safe(list(value))
+    except Exception:
+        return []
+
+
+def _image_to_data_url(image):
+    if image is None:
+        return None
+    try:
+        import cv2
+
+        ok, buffer = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 82],
+        )
+        if not ok:
+            return None
+        encoded = base64.b64encode(buffer).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception as exc:
+        logging.debug(f"Could not encode inference frame image: {exc}")
+        return None
+
+
+def _serialize_yolo_result(result):
+    orig_img = getattr(result, "orig_img", None)
+    orig_shape = getattr(result, "orig_shape", None) or ()
+    if len(orig_shape) >= 2:
+        height, width = int(orig_shape[0]), int(orig_shape[1])
+    elif orig_img is not None and hasattr(orig_img, "shape") and len(orig_img.shape) >= 2:
+        height, width = int(orig_img.shape[0]), int(orig_img.shape[1])
+    else:
+        height, width = 0, 0
+
+    boxes_obj = getattr(result, "boxes", None)
+    boxes = _array_like_to_list(getattr(boxes_obj, "xyxy", None)) if boxes_obj is not None else []
+    scores = _array_like_to_list(getattr(boxes_obj, "conf", None)) if boxes_obj is not None else []
+    classes = _array_like_to_list(getattr(boxes_obj, "cls", None)) if boxes_obj is not None else []
+    names = getattr(result, "names", {}) or {}
+    class_names = []
+    for class_id in classes:
+        try:
+            class_names.append(names.get(int(class_id), f"class_{int(class_id)}"))
+        except Exception:
+            class_names.append(str(class_id))
+
+    polygons = []
+    masks_obj = getattr(result, "masks", None)
+    mask_polygons = getattr(masks_obj, "xy", None) if masks_obj is not None else None
+    if mask_polygons is not None:
+        polygons = [_array_like_to_list(poly) for poly in mask_polygons]
+
+    return {
+        "kind": "yolo",
+        "width": width,
+        "height": height,
+        "boxes": boxes,
+        "scores": scores,
+        "classes": classes,
+        "class_names": class_names,
+        "polygons": polygons,
+        "image_data_url": _image_to_data_url(orig_img),
+        "detections": len(boxes),
+    }
+
+
+def _normalize_chunk_payload(chunk_data):
+    if isinstance(chunk_data, dict) and "images" in chunk_data:
+        return {**_json_safe(chunk_data), "kind": chunk_data.get("kind", "sam")}
+    if hasattr(chunk_data, "boxes"):
+        return {"kind": "yolo", "images": [_serialize_yolo_result(chunk_data)]}
+    if isinstance(chunk_data, (list, tuple)) and any(hasattr(item, "boxes") for item in chunk_data):
+        return {"kind": "yolo", "images": [_serialize_yolo_result(item) for item in chunk_data]}
+    return _json_safe(chunk_data)
 
 
 
@@ -492,6 +595,7 @@ async def handle_fetch_inference_chunk(websocket: WebSocket, data: dict, context
         if save_file and os.path.exists(save_file):
             with open(save_file, 'rb') as f:
                 chunk_data = pickle.load(f)
+        chunk_data = _normalize_chunk_payload(chunk_data)
 
         await websocket.send_text(json.dumps({
             "action": "inference_chunk_data",
