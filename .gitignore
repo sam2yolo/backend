@@ -7,6 +7,8 @@ __pycache__/
 *.py[cod]
 
 files/
+!website/src/routes/api/files/
+!website/src/routes/api/files/+server.js
 results/
 *.pt
 
