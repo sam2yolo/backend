@@ -437,27 +437,30 @@ async def handle_fetch_inference_chunk(websocket: WebSocket, data: dict, context
         }))
         return
 
-    results = context.inference_results.get(task_id)
-    if results is None:
-        await websocket.send_text(json.dumps({
-            "action": "inference_chunks_error",
-            "payload": {"error": f"No results found for task {task_id}"}
-        }))
-        return
+    def _as_info(entry):
+        # Chunk metadata may be stored as a dict (SAM) or a [dict] list (YOLO).
+        if isinstance(entry, list):
+            return entry[0] if entry else None
+        if isinstance(entry, dict):
+            return entry
+        return None
 
     chunk_id = data.get("chunk_id")
     if chunk_id:
-        # Fetch a single chunk
-        chunk_entries = results.get(chunk_id)
-        if not chunk_entries:
+        # SAM stores chunks at the top level keyed by chunk_id; YOLO may nest
+        # them under inference_results[task_id][chunk_id]. Handle both.
+        chunk_info = _as_info(context.inference_results.get(chunk_id))
+        if chunk_info is None:
+            nested = context.inference_results.get(task_id)
+            if isinstance(nested, dict):
+                chunk_info = _as_info(nested.get(chunk_id))
+        if chunk_info is None:
             await websocket.send_text(json.dumps({
                 "action": "inference_chunks_error",
                 "payload": {"error": f"Chunk {chunk_id} not found for task {task_id}"}
             }))
             return
 
-        # Load the pickle data from the first entry
-        chunk_info = chunk_entries[0]
         save_file = chunk_info.get("save_file")
         chunk_data = []
         if save_file and os.path.exists(save_file):
@@ -476,11 +479,18 @@ async def handle_fetch_inference_chunk(websocket: WebSocket, data: dict, context
             }
         }))
     else:
-        # Return list of all chunks
+        # List all chunks for the task — search both storage shapes.
         chunk_list = []
-        for cid, entries in results.items():
-            if entries:
-                chunk_list.append(entries[0])
+        for cid, entry in context.inference_results.items():
+            info = _as_info(entry)
+            if info and info.get("task_id") == task_id:
+                chunk_list.append({**info, "chunk_id": cid})
+        nested = context.inference_results.get(task_id)
+        if isinstance(nested, dict):
+            for cid, entry in nested.items():
+                info = _as_info(entry)
+                if info:
+                    chunk_list.append({**info, "chunk_id": cid})
 
         await websocket.send_text(json.dumps({
             "action": "inference_chunk_list",

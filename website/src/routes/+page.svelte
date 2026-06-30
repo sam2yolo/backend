@@ -1,6 +1,8 @@
 <script>
 	import { resolve } from '$app/paths';
 	import { onDestroy, onMount } from 'svelte';
+	import { createRoom, listWorkers, randomWorkerName, bootstrapCommand } from '$lib/broker';
+	import { renderResult } from '$lib/sammask';
 
 	const tabs = [
 		'Overview',
@@ -43,12 +45,28 @@
 	let modelState = $state('Not loaded');
 	let modelReady = $state(false);
 	let modelVariant = $state('yolo11n');
-	let pendingTask = null;
+	let pendingTasks = []; // tasks to queue once the right model is ready
+	let loadedModelType = $state(''); // 'sam' | 'yolo' — which model is currently loaded
+	let requestedModelType = ''; // model type being initialized
+	// Inference defaults to SAM 3.1 (text-prompted segmentation); YOLO is for training.
+	let inferenceModel = $state('sam');
+	let samBaseUrl = $state('http://127.0.0.1:8001');
+	let newPromptText = $state('');
+	let samBatch = $state(4);
 	let kaggleNotebookRef = $state(defaultKaggleNotebookRef);
 	let kaggleRoomId = $state('');
 	let kaggleRoomSecret = $state('');
 	let kaggleNotebookName = $state('notebooka28c21424b');
 	let kaggleTunnelUrl = $state('');
+
+	// --- Fleet: auto-created room + workers discovered via the broker ---
+	let fleetRoomId = $state('');
+	let fleetRoomSecret = $state('');
+	let fleetWorkerName = $state('');
+	let fleetWorkers = $state([]); // [{ tunnel_id, name, remote_port, http_url, ws_url, alive, status }]
+	let fleetBusy = $state(false);
+	let fleetError = $state('');
+	let fleetPollTimer = null;
 
 	let uploadedImports = $state([]);
 	let selectedImportId = $state('');
@@ -91,6 +109,11 @@
 
 	let tasks = $state([]);
 
+	// Realtime results: original image URLs (by backend file_id) + streamed frames.
+	let originalUrls = $state({}); // file_id -> object URL (for overlay backgrounds)
+	let liveResults = $state([]); // [{ key, taskId, className, frameIndex, result, imgUrl, detections }]
+	let totalDetections = $state(0);
+
 	function defaultBackendUrl() {
 		return `${location.protocol}//${location.hostname}:8000`;
 	}
@@ -132,6 +155,70 @@
 		} catch {
 			connectionState = 'Invalid backend URL';
 		}
+	}
+
+	// --- Fleet / room management ------------------------------------------
+	async function createFleetRoom() {
+		fleetBusy = true;
+		fleetError = '';
+		try {
+			const room = await createRoom('fleet-vision');
+			fleetRoomId = room.room_id;
+			fleetRoomSecret = room.room_secret;
+			if (!fleetWorkerName) fleetWorkerName = randomWorkerName();
+			notify('Room created — paste the command on each GPU machine');
+			startFleetPolling();
+		} catch (error) {
+			fleetError = error?.message || 'Could not create room';
+			notify(fleetError);
+		} finally {
+			fleetBusy = false;
+		}
+	}
+
+	function fleetCommand() {
+		if (!fleetRoomId) return '';
+		return bootstrapCommand(fleetRoomId, fleetRoomSecret, fleetWorkerName || randomWorkerName());
+	}
+
+	function regenerateWorkerName() {
+		fleetWorkerName = randomWorkerName();
+	}
+
+	async function refreshFleetWorkers() {
+		if (!fleetRoomId) return;
+		try {
+			fleetWorkers = await listWorkers(fleetRoomId);
+		} catch (error) {
+			fleetError = error?.message || 'Could not list workers';
+		}
+	}
+
+	function startFleetPolling() {
+		stopFleetPolling();
+		refreshFleetWorkers();
+		fleetPollTimer = setInterval(refreshFleetWorkers, 4000);
+	}
+
+	function stopFleetPolling() {
+		if (fleetPollTimer) {
+			clearInterval(fleetPollTimer);
+			fleetPollTimer = null;
+		}
+	}
+
+	function copyFleetCommand() {
+		const command = fleetCommand();
+		if (!command) return;
+		navigator.clipboard?.writeText(command);
+		notify('Bootstrap command copied');
+	}
+
+	function connectToWorker(worker) {
+		backendUrl = worker.http_url;
+		connectBackend();
+		setTab('Inference');
+		notify(`Connecting to ${worker.name}`);
 	}
 
 	function upsertTask(id, attrs = {}) {
@@ -189,15 +276,16 @@
 					break;
 				case 'model_init_completed':
 					modelReady = true;
-					modelState = payload.model_name || modelVariant;
+					loadedModelType = requestedModelType || loadedModelType;
+					modelState = payload.model_name || loadedModelType || modelVariant;
 					notify(`${modelState} is ready`);
-					queuePendingTask();
+					queuePendingTasks();
 					break;
 				case 'model_setup_error':
 				case 'model_init_error':
 					modelReady = false;
 					modelState = 'Failed';
-					pendingTask = null;
+					pendingTasks = [];
 					notify(errorMessage(payload));
 					break;
 				case 'file_download_initiated':
@@ -231,7 +319,11 @@
 							payload.id,
 						status: 'Queued',
 						progress: 0,
-						type: payload.type || 'inference'
+						type: payload.type || 'inference',
+						// remember enough to map chunk results back to source frames
+						file_ids: payload.file_ids || (payload.file_id ? [payload.file_id] : []),
+						batch: payload.batch || 1,
+						className: payload.class_name || payload.text_prompt || null
 					});
 					send('start_inference_from_queue');
 					break;
@@ -248,8 +340,19 @@
 					const current = tasks.find((task) => task.id === payload.task_id);
 					const chunks = [...(current?.chunks || []), payload.chunk_id];
 					upsertTask(payload.task_id, { chunks });
+					// Pull the chunk's JSON so we can render masks live (SAM only —
+					// SAM chunk data is plain JSON; YOLO chunks are pickled objects).
+					if (current?.className != null || loadedModelType === 'sam') {
+						send('fetch_inference_chunk', {
+							task_id: payload.task_id,
+							chunk_id: payload.chunk_id
+						});
+					}
 					break;
 				}
+				case 'inference_chunk_data':
+					ingestChunkData(payload);
+					break;
 				case 'inference_completed':
 					upsertTask(id, { status: 'Completed', progress: 100 });
 					notify('Traffic inference completed');
@@ -346,19 +449,35 @@
 		}
 	}
 
-	function ensureModel(task) {
+	function ensureModel(modelType, taskList) {
 		if (connectionState !== 'Connected') {
 			notify('Connect to the backend first');
 			return;
 		}
-		pendingTask = task;
-		if (modelReady) {
-			queuePendingTask();
+		pendingTasks = Array.isArray(taskList) ? taskList : [taskList];
+		// Reuse the loaded model only if it's the same type and ready.
+		if (modelReady && loadedModelType === modelType) {
+			queuePendingTasks();
 			return;
 		}
+		modelReady = false;
+		requestedModelType = modelType;
 		modelState = 'Starting';
-		send('init_model', { model_name: 'yolo', variant_name: modelVariant });
-		notify('Preparing the YOLO environment; the first run can take longer');
+		if (modelType === 'sam') {
+			send('init_model', { model_name: 'sam', base_url: samBaseUrl });
+			notify('Initializing SAM 3.1 on the worker');
+		} else {
+			send('init_model', { model_name: 'yolo', variant_name: modelVariant });
+			notify('Preparing the YOLO environment; the first run can take longer');
+		}
+	}
+
+	function addPrompt() {
+		const value = newPromptText.trim();
+		if (value && !promptTags.includes(value)) {
+			promptTags = [...promptTags, value];
+		}
+		newPromptText = '';
 	}
 
 	function initializeModel() {
@@ -371,14 +490,15 @@
 			return;
 		}
 		modelState = 'Starting';
+		requestedModelType = 'yolo';
 		send('init_model', { model_name: 'yolo', variant_name: modelVariant });
 	}
 
-	function queuePendingTask() {
-		if (!pendingTask) return;
-		const task = pendingTask;
-		pendingTask = null;
-		send('create_inference_task', task);
+	function queuePendingTasks() {
+		if (!pendingTasks.length) return;
+		const queue = pendingTasks;
+		pendingTasks = [];
+		for (const task of queue) send('create_inference_task', task);
 	}
 
 	function startInference() {
@@ -388,10 +508,15 @@
 			return;
 		}
 
+		if (inferenceModel === 'sam') {
+			startSamInference(file);
+			return;
+		}
+
 		const classes = [
 			...new Set(promptTags.map((tag) => cocoVehicleClasses[tag]).filter(Number.isInteger))
 		];
-		ensureModel({
+		ensureModel('yolo', {
 			name: `Traffic · ${file.name}`,
 			file_id: file.id,
 			file_ids: [file.id],
@@ -406,6 +531,76 @@
 		});
 	}
 
+	// SAM 3.1: image-only, one task per text prompt. Each prompt becomes a class
+	// in the compiled dataset (prompt index = class id).
+	function startSamInference(file) {
+		if (!promptTags.length) {
+			notify('Add at least one text prompt for SAM');
+			return;
+		}
+		if (detectFileType(file.name) !== 'image') {
+			notify('SAM needs images. Pick image imports (video frame sampling is coming next).');
+			return;
+		}
+		const fileIds = [file.id];
+		const tasks = promptTags.map((prompt, classId) => ({
+			name: `SAM · ${prompt}`,
+			file_ids: fileIds,
+			file_type: 'image',
+			text_prompt: prompt,
+			conf: Number(confidence),
+			batch: Number(samBatch),
+			class_id: classId,
+			class_name: prompt
+		}));
+		liveResults = [];
+		totalDetections = 0;
+		ensureModel('sam', tasks);
+	}
+
+	// Turn a fetched SAM chunk into renderable live-result tiles.
+	function ingestChunkData(payload) {
+		const task = tasks.find((t) => t.id === payload.task_id);
+		const images = payload.data?.images || [];
+		const batch = task?.batch || 1;
+		const fileIds = task?.file_ids || [];
+		const className = task?.className || 'objects';
+		const chunkIndex = payload.chunk_index ?? 0;
+		const additions = images.map((result, j) => {
+			const globalIdx = chunkIndex * batch + j;
+			const fileId = fileIds[globalIdx];
+			const detections = (result.masks || []).length;
+			totalDetections += detections;
+			return {
+				key: `${payload.task_id}-${payload.chunk_id}-${j}`,
+				taskId: payload.task_id,
+				className,
+				frameIndex: globalIdx,
+				result,
+				imgUrl: fileId ? originalUrls[fileId] : null,
+				detections
+			};
+		});
+		liveResults = [...additions, ...liveResults].slice(0, 200);
+	}
+
+	// Svelte action: paint a SAM result onto a <canvas>, over its source image.
+	function drawResult(node, params) {
+		function paint(p) {
+			if (!p?.result) return;
+			if (p.imgUrl) {
+				const img = new Image();
+				img.onload = () => renderResult(node, img, p.result);
+				img.onerror = () => renderResult(node, null, p.result);
+				img.src = p.imgUrl;
+			} else {
+				renderResult(node, null, p.result);
+			}
+		}
+		paint(params);
+		return { update: paint };
+	}
+
 	function startTraining() {
 		const validationFile = selectedTrainingAnchor();
 		const trainDataPath = datasetPath.trim() || datasetRootPath.trim();
@@ -417,7 +612,7 @@
 			notify('Enter a backend-visible data.yaml path or dataset zip path');
 			return;
 		}
-		ensureModel({
+		ensureModel('yolo', {
 			type: 'train',
 			name: trainingName.trim() || 'traffic-fast',
 			file_id: validationFile.id,
@@ -451,6 +646,7 @@
 
 	onDestroy(() => {
 		socket?.close?.();
+		stopFleetPolling();
 	});
 
 	function saveBackendUrl() {
@@ -547,11 +743,14 @@
 
 	async function handleLocalFileChange(event) {
 		const files = Array.from(event.currentTarget.files ?? []).filter(
-			(file) => file.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(file.name)
+			(file) =>
+				file.type.startsWith('video/') ||
+				file.type.startsWith('image/') ||
+				/\.(mp4|mov|m4v|webm|avi|mkv|jpe?g|png|webp|bmp)$/i.test(file.name)
 		);
 		event.currentTarget.value = '';
 		if (!files.length) {
-			notify('Choose a video file');
+			notify('Choose an image or video file');
 			return;
 		}
 
@@ -563,11 +762,21 @@
 			const response = await fetch('/api/uploads', { method: 'POST', body });
 			const result = await response.json();
 			if (!response.ok) throw new Error(result.message || 'Upload failed');
+			// Keep local object URLs for images so we can overlay SAM masks on them.
+			// result.files is returned in the same order we appended `files`.
+			const urls = {};
+			result.files.forEach((record, index) => {
+				const source = files[index];
+				if (source && source.type.startsWith('image/')) {
+					urls[record.id] = URL.createObjectURL(source);
+				}
+			});
+			if (Object.keys(urls).length) originalUrls = { ...originalUrls, ...urls };
 			uploadedImports = [...result.files, ...uploadedImports];
-			selectedImportId ||= result.files[0]?.id || '';
+			selectedImportId ||= result.files.find(isMediaFile)?.id || '';
 			selectedTrainingAnchorId ||= result.files.find(isMediaFile)?.id || '';
 			notify(
-				`${result.files.length} video file${result.files.length === 1 ? '' : 's'} uploaded to backend`
+				`${result.files.length} file${result.files.length === 1 ? '' : 's'} uploaded to backend`
 			);
 		} catch (error) {
 			notify(error instanceof Error ? error.message : 'Upload failed');
@@ -871,6 +1080,24 @@
 								</div>
 							{/each}
 						</div>
+
+						{#if liveResults.length}
+							<div class="section-title-row">
+								<h2>Live results</h2>
+								<span class="status-pill">{liveResults.length} frames · {totalDetections} det</span>
+							</div>
+							<div class="result-grid">
+								{#each liveResults as item (item.key)}
+									<figure class="result-tile">
+										<canvas use:drawResult={{ result: item.result, imgUrl: item.imgUrl }}></canvas>
+										<figcaption>
+											<span class="result-class">{item.className}</span>
+											<span class="result-badge" class:zero={!item.detections}>{item.detections}</span>
+										</figcaption>
+									</figure>
+								{/each}
+							</div>
+						{/if}
 					{:else if activeTab === 'Remotes'}
 						<div class="section-title-row">
 							<h2>Remotes</h2>
@@ -889,6 +1116,75 @@
 								Status: {connectionState} · Model: {modelState}
 								{modelReady ? 'ready' : 'not ready'}
 							</small>
+						</div>
+
+						<div class="remote-card fleet-card">
+							<div class="section-title-row">
+								<div>
+									<h3>Fleet — auto room</h3>
+									<p>
+										Create a room here, then paste the generated command on each GPU
+										machine. Workers appear below as they come online.
+									</p>
+								</div>
+								<span class="status-pill"
+									>{fleetWorkers.length} worker{fleetWorkers.length === 1 ? '' : 's'}</span
+								>
+							</div>
+
+							{#if !fleetRoomId}
+								<button
+									class="primary-action"
+									type="button"
+									disabled={fleetBusy}
+									onclick={createFleetRoom}
+								>
+									{fleetBusy ? 'Creating room…' : 'Create room'}
+								</button>
+							{:else}
+								<div class="settings-grid compact">
+									<label>Room ID <input readonly value={fleetRoomId} /></label>
+									<label>
+										Worker name
+										<span class="input-action">
+											<input bind:value={fleetWorkerName} placeholder="nimble-sloth-9341" />
+											<button type="button" onclick={regenerateWorkerName}>↻</button>
+										</span>
+									</label>
+								</div>
+
+								<label class="code-label">
+									Paste on each GPU machine
+									<textarea readonly value={fleetCommand()}></textarea>
+								</label>
+
+								<div class="remote-actions">
+									<button class="ghost-button" type="button" onclick={copyFleetCommand}
+										>Copy command</button
+									>
+									<button class="ghost-button" type="button" onclick={refreshFleetWorkers}
+										>Refresh workers</button
+									>
+								</div>
+							{/if}
+
+							{#if fleetError}
+								<small class="fleet-error">{fleetError}</small>
+							{/if}
+
+							{#if fleetWorkers.length}
+								<div class="remote-list">
+									{#each fleetWorkers as worker (worker.tunnel_id)}
+										<div class="remote-row">
+											<span class="status-dot" class:online={worker.alive}></span>
+											<strong>{worker.name}</strong>
+											<span>{worker.alive ? 'Online' : worker.status || 'Pending'}</span>
+											<small>{worker.http_url}</small>
+											<button type="button" onclick={() => connectToWorker(worker)}>Connect</button>
+										</div>
+									{/each}
+								</div>
+							{/if}
 						</div>
 
 						<div class="remote-card kaggle-card">
@@ -1010,13 +1306,13 @@
 							</div>
 							{#if importMode === 'upload'}
 								<div class="upload-card">
-									<p>Upload video files<br />from local device</p>
-									<span>MP4, MOV, WEBM, AVI, MKV</span>
+									<p>Upload images or video<br />from local device</p>
+									<span>JPG, PNG · MP4, MOV, WEBM, AVI, MKV</span>
 									<input
 										bind:this={localFileInput}
 										class="hidden-file-input"
 										type="file"
-										accept="video/*,.mp4,.mov,.m4v,.webm,.avi,.mkv"
+										accept="image/*,video/*,.jpg,.jpeg,.png,.webp,.bmp,.mp4,.mov,.m4v,.webm,.avi,.mkv"
 										multiple
 										onchange={handleLocalFileChange}
 									/>
@@ -1054,19 +1350,48 @@
 							<p class="empty-imports">No uploaded video files yet.</p>
 						{/if}
 					{:else if activeTab === 'Inference'}
+						<div class="model-switch">
+							<span class="field-label">Inference model</span>
+							<div class="seg-control">
+								<button
+									class:active={inferenceModel === 'sam'}
+									onclick={() => (inferenceModel = 'sam')}>SAM 3.1</button
+								>
+								<button
+									class:active={inferenceModel === 'yolo'}
+									onclick={() => (inferenceModel = 'yolo')}>YOLO</button
+								>
+							</div>
+							<small>
+								{inferenceModel === 'sam'
+									? 'Text-prompted segmentation. Each prompt below becomes a dataset class.'
+									: 'COCO-class detection/segmentation. Prompts map to vehicle classes.'}
+							</small>
+						</div>
+
 						<div class="split-grid">
 							<div>
-								<h2>Prompts</h2>
+								<h2>{inferenceModel === 'sam' ? 'Text prompts (classes)' : 'Prompts'}</h2>
 								<div class="form-group">
 									<span class="field-label">Create new</span>
-									<div class="input-action">
-										<select bind:value={selectedPromptType}>
-											<option value="" disabled>Select type</option>
-											{#each vehicleTypes as v (v)}
-												<option value={v}>{v}</option>
-											{/each}
-										</select>
-										<button
+									{#if inferenceModel === 'sam'}
+										<div class="input-action">
+											<input
+												bind:value={newPromptText}
+												placeholder="e.g. person, delivery truck"
+												onkeydown={(e) => e.key === 'Enter' && addPrompt()}
+											/>
+											<button disabled={!newPromptText.trim()} onclick={addPrompt}>Add</button>
+										</div>
+									{:else}
+										<div class="input-action">
+											<select bind:value={selectedPromptType}>
+												<option value="" disabled>Select type</option>
+												{#each vehicleTypes as v (v)}
+													<option value={v}>{v}</option>
+												{/each}
+											</select>
+											<button
 											disabled={!selectedPromptType}
 											onclick={() => {
 												if (selectedPromptType && !promptTags.includes(selectedPromptType)) {
@@ -1076,6 +1401,7 @@
 											}}>Add</button
 										>
 									</div>
+									{/if}
 									{#if promptTags.length}
 										<div class="chips">
 											{#each promptTags as tag (tag)}
@@ -1962,6 +2288,98 @@
 		color: #fff;
 		font-size: 0.72rem;
 		font-weight: 800;
+	}
+
+	.status-dot {
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: #c9542f;
+		box-shadow: 0 0 0 3px rgba(201, 84, 47, 0.18);
+	}
+
+	.status-dot.online {
+		background: #3fb950;
+		box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.2);
+	}
+
+	.fleet-error {
+		display: block;
+		margin-top: 8px;
+		color: #f85149;
+	}
+
+	.model-switch {
+		margin-bottom: 18px;
+	}
+
+	.seg-control {
+		display: inline-flex;
+		border: 1px solid #2a2a2a;
+		border-radius: 10px;
+		overflow: hidden;
+		margin: 6px 0;
+	}
+
+	.seg-control button {
+		border: 0;
+		background: #141414;
+		color: #cfcfcf;
+		padding: 8px 18px;
+		font-weight: 700;
+		cursor: pointer;
+	}
+
+	.seg-control button.active {
+		background: #2f81f7;
+		color: #fff;
+	}
+
+	.result-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+		gap: 12px;
+		margin-top: 12px;
+	}
+
+	.result-tile {
+		margin: 0;
+		background: #0f0f0f;
+		border: 1px solid #242424;
+		border-radius: 12px;
+		overflow: hidden;
+	}
+
+	.result-tile canvas {
+		display: block;
+		width: 100%;
+		height: auto;
+		background: #000;
+	}
+
+	.result-tile figcaption {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 6px 10px;
+		font-size: 0.78rem;
+	}
+
+	.result-class {
+		color: #cfcfcf;
+		text-transform: capitalize;
+	}
+
+	.result-badge {
+		background: #2f81f7;
+		color: #fff;
+		border-radius: 10px;
+		padding: 1px 9px;
+		font-weight: 800;
+	}
+
+	.result-badge.zero {
+		background: #3a3a3a;
 	}
 
 	.kaggle-steps {
